@@ -1,0 +1,10 @@
+gitlab_url = "https://gitlab.cern.ch"
+project = "ftorresd/todo"
+token = "set-me-via-env-or-local-config"
+theme = "catppuccin"
+status_labels = [
+  "status::todo",
+  "status::doing",
+  "status::blocked",
+  "status::done",
+]
