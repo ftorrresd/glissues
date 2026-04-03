@@ -36,17 +36,16 @@ Supported settings:
 
 - `project` as a full GitLab project URL
 - `token`
-- `status_labels`
+- `theme`
 
 Environment variables:
 
 - `GLISSUES_PROJECT`
 - `GLISSUES_PROJECT_URL`
 - `GLISSUES_TOKEN`
-- `GLISSUES_STATUS_LABELS`
 
 Project URL and token are mandatory and must be provided through CLI flags or environment variables.
-The config file is only used for optional local settings like `status_labels`.
+The config file in `~/.config/glissues/config.toml` is used for optional local settings like `theme`.
 
 A sample config file is included as `config.example.toml`.
 
@@ -62,6 +61,22 @@ You can also pass the project URL directly:
 
 ```bash
 cargo run --release -- --project "https://gitlab.cern.ch/ftorresd/todo" --token "your-token"
+```
+
+## Install
+
+To install the latest released version into your user-local bin directory:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/ftorrresd/glissues/main/scripts/install.sh | sh
+```
+
+The installer downloads the newest GitHub release for your platform and installs `glissues` into `~/.local/bin` by default.
+
+If `~/.local/bin` is not already on your `PATH`, add it to your shell profile:
+
+```bash
+export PATH="$HOME/.local/bin:$PATH"
 ```
 
 ## Keybindings
@@ -100,9 +115,14 @@ Inside the editor/comment popups:
 - `#`: open issue mention picker and insert an issue reference like `#19`
 - `Ctrl-s`: save
 
+## Automation
+
+- Pull requests and pushes to `main` run formatting, tests, and a release-build check in GitHub Actions
+- Published GitHub releases build and upload release archives for supported Linux and macOS targets
+
 ## Notes
 
 - Workflow state is modeled with labels like `status::todo`, `status::doing`, `status::blocked`, and `status::done`.
 - GitLab issue `opened` / `closed` remains the source of truth for lifecycle state.
 - Startup and refresh preload issue comments into memory so opening issue details is immediate after loading completes.
-- The UI uses `ratatui-themes` with Rosé Pine as the default theme, and you can cycle themes live from the built-in selector.
+- The UI uses `ratatui-themes` with Rosé Pine as the default theme, and your last chosen theme is remembered in `~/.config/glissues/config.toml`.

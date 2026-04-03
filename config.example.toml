@@ -1,6 +1,1 @@
-status_labels = [
-  "status::todo",
-  "status::doing",
-  "status::blocked",
-  "status::done",
-]
+theme = "rose-pine"

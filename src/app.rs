@@ -5,7 +5,7 @@ use std::thread;
 use anyhow::{Result, anyhow};
 use chrono::{Datelike, Duration, Local, NaiveDate};
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
-use ratatui_themes::{Theme, ThemeName};
+use ratatui_themes::Theme;
 
 use crate::config::AppConfig;
 use crate::editor::TextBuffer;
@@ -13,6 +13,12 @@ use crate::gitlab::{GitLabClient, IssueDraft, IssueUpdate, StateEvent};
 use crate::model::{Issue, IssueLink, Note};
 
 const SPINNER_FRAMES: &[&str] = &["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
+const DEFAULT_STATUS_LABELS: &[&str] = &[
+    "status::todo",
+    "status::doing",
+    "status::blocked",
+    "status::done",
+];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Mode {
@@ -193,9 +199,10 @@ pub struct App {
 
 impl App {
     pub fn new(config: AppConfig, client: GitLabClient) -> Result<Self> {
+        let theme_name = config.theme;
         Ok(Self {
             config,
-            theme: Theme::new(ThemeName::RosePine),
+            theme: Theme::new(theme_name),
             client,
             issues: Vec::new(),
             labels: Vec::new(),
@@ -468,7 +475,10 @@ impl App {
     }
 
     pub fn available_statuses(&self) -> Vec<String> {
-        let mut statuses = self.config.status_labels.clone();
+        let mut statuses = DEFAULT_STATUS_LABELS
+            .iter()
+            .map(|label| (*label).to_string())
+            .collect::<Vec<_>>();
         for label in &self.labels {
             if label.starts_with("status::") && !statuses.contains(label) {
                 statuses.push(label.clone());
@@ -817,10 +827,12 @@ impl App {
             }
             KeyCode::Left | KeyCode::Char('h') => {
                 self.theme.prev();
+                self.config.save_theme(self.theme.name)?;
                 self.status_line = format!("theme: {}", self.theme.name.display_name());
             }
             KeyCode::Right | KeyCode::Char('l') => {
                 self.theme.next();
+                self.config.save_theme(self.theme.name)?;
                 self.status_line = format!("theme: {}", self.theme.name.display_name());
             }
             _ => {}
@@ -1472,11 +1484,7 @@ impl App {
     }
 
     fn default_status(&self) -> String {
-        self.config
-            .status_labels
-            .first()
-            .cloned()
-            .unwrap_or_else(|| String::from("status::todo"))
+        String::from(DEFAULT_STATUS_LABELS[0])
     }
 
     fn toggle_selected_issue_state(&mut self) -> Result<()> {
@@ -1933,9 +1941,10 @@ impl App {
     }
 
     fn rebuild_label_catalog(&mut self) {
-        for label in &self.config.status_labels {
-            if !self.labels.contains(label) {
-                self.labels.push(label.clone());
+        for label in DEFAULT_STATUS_LABELS {
+            let label = label.to_string();
+            if !self.labels.contains(&label) {
+                self.labels.push(label);
             }
         }
 

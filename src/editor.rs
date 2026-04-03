@@ -174,3 +174,27 @@ impl TextBuffer {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn insert_str_appends_text_at_cursor() {
+        let mut buffer = TextBuffer::from_text("hi");
+        buffer.move_line_end();
+        buffer.insert_str(" there");
+
+        assert_eq!(buffer.to_text(), "hi there");
+    }
+
+    #[test]
+    fn backspace_merges_lines() {
+        let mut buffer = TextBuffer::from_text("hello\nworld");
+        buffer.move_down();
+        buffer.move_line_start();
+        buffer.backspace();
+
+        assert_eq!(buffer.to_text(), "helloworld");
+    }
+}
