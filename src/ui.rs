@@ -1,12 +1,47 @@
 use chrono::{Datelike, Duration, Local, NaiveDate};
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
-use ratatui::style::{Modifier, Style};
+use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span, Text};
 use ratatui::widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph, Wrap};
+use ratatui_themes::{ThemePalette, ThemePicker};
 
 use crate::app::{App, DueDatePickerState, EditorField, Mode, format_timestamp, parse_due_date};
+use crate::editor::TextBuffer;
 use crate::markdown::render_markdown;
+
+#[derive(Clone, Copy)]
+struct Colors {
+    bg: Color,
+    panel: Color,
+    panel_alt: Color,
+    text: Color,
+    muted: Color,
+    accent: Color,
+    accent_alt: Color,
+    warn: Color,
+    danger: Color,
+    iris: Color,
+    rose: Color,
+    info: Color,
+}
+
+fn colors(palette: ThemePalette) -> Colors {
+    Colors {
+        bg: palette.bg,
+        panel: palette.bg,
+        panel_alt: palette.selection,
+        text: palette.fg,
+        muted: palette.muted,
+        accent: palette.accent,
+        accent_alt: palette.success,
+        warn: palette.warning,
+        danger: palette.error,
+        iris: palette.secondary,
+        rose: palette.secondary,
+        info: palette.info,
+    }
+}
 
 pub fn draw(frame: &mut Frame, app: &mut App) {
     let area = frame.area();
@@ -38,22 +73,48 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
     match app.mode {
         Mode::Help => draw_help(frame, area, app),
         Mode::IssueView => draw_issue_view(frame, area, app),
+        Mode::ConfirmDelete => draw_confirm_delete(frame, area, app),
         Mode::IssueEditor => draw_issue_editor(frame, area, app),
         Mode::CommentEditor => draw_comment_editor(frame, area, app),
         Mode::LabelEditor => draw_label_editor(frame, area, app),
+        Mode::BlockerPicker => {}
+        Mode::ThemePicker => {}
         Mode::Selector => draw_selector(frame, area, app),
         Mode::DueDatePicker => draw_due_date_picker(frame, area, app),
         Mode::Search | Mode::Command | Mode::Normal => {}
     }
+
+    if app.has_mention_picker() {
+        draw_mention_picker(frame, area, app);
+    }
+
+    if app.has_blocker_picker() {
+        draw_blocker_picker(frame, area, app);
+    }
+
+    if matches!(app.mode, Mode::ThemePicker) {
+        draw_theme_picker(frame, area, app);
+    }
+
+    if app.is_loading() {
+        draw_loading(frame, area, app);
+    }
+
+    if app.has_alert() {
+        draw_alert(frame, area, app);
+    }
 }
 
 fn draw_header(frame: &mut Frame, area: Rect, app: &App) {
-    let theme = &app.theme;
+    let c = colors(app.theme.palette());
     let status = format!(
-        " {}  {}  theme:{}  state:{}  label:{}  status:{}  search:{} ",
+        " {}  {}  theme:{}  open:{}  closed:{}  overdue:{}  state:{}  label:{}  status:{}  search:{} ",
         app.mode_label(),
         app.config.project,
-        app.config.theme.as_str(),
+        app.theme.name.display_name(),
+        app.count_open(),
+        app.count_closed(),
+        app.count_overdue(),
         app.state_label(),
         app.filters.label.as_deref().unwrap_or("any"),
         app.filters.status.as_deref().unwrap_or("any"),
@@ -64,77 +125,73 @@ fn draw_header(frame: &mut Frame, area: Rect, app: &App) {
         },
     );
 
-    let bar = Paragraph::new(status).style(
-        Style::default()
-            .bg(theme.panel_alt)
-            .fg(theme.text)
-            .add_modifier(Modifier::BOLD),
+    frame.render_widget(
+        Paragraph::new(status).style(
+            Style::default()
+                .bg(c.panel_alt)
+                .fg(c.text)
+                .add_modifier(Modifier::BOLD),
+        ),
+        area,
     );
-    frame.render_widget(bar, area);
 }
 
 fn draw_sidebar(frame: &mut Frame, area: Rect, app: &App) {
-    let theme = &app.theme;
+    let c = colors(app.theme.palette());
     let today = Local::now().date_naive();
     let selected_issue = app.selected_issue().map(|issue| issue.iid);
 
     let lines = vec![
         Line::from(vec![Span::styled(
             "Views",
-            Style::default()
-                .fg(theme.accent)
-                .add_modifier(Modifier::BOLD),
+            Style::default().fg(c.accent).add_modifier(Modifier::BOLD),
         )]),
-        sidebar_line(theme, "All", app.issues.len(), app.state_label() == "all"),
-        sidebar_line(theme, "Open", app.count_open(), app.state_label() == "open"),
+        sidebar_line(c, "All", app.issues.len(), app.state_label() == "all"),
+        sidebar_line(c, "Open", app.count_open(), app.state_label() == "open"),
         sidebar_line(
-            theme,
+            c,
             "Closed",
             app.count_closed(),
             app.state_label() == "closed",
         ),
-        sidebar_line(theme, "Overdue", app.count_overdue(), false),
+        sidebar_line(c, "Overdue", app.count_overdue(), false),
         Line::default(),
         Line::from(vec![Span::styled(
             "Scope",
-            Style::default()
-                .fg(theme.accent)
-                .add_modifier(Modifier::BOLD),
+            Style::default().fg(c.accent).add_modifier(Modifier::BOLD),
         )]),
         Line::from(vec![
-            Span::styled("Label  ", Style::default().fg(theme.muted)),
+            Span::styled("Label  ", Style::default().fg(c.muted)),
             Span::styled(
                 app.filters.label.as_deref().unwrap_or("any"),
-                Style::default().fg(theme.text),
+                Style::default().fg(c.text),
             ),
         ]),
         Line::from(vec![
-            Span::styled("Status ", Style::default().fg(theme.muted)),
+            Span::styled("Status ", Style::default().fg(c.muted)),
             Span::styled(
                 app.filters.status.as_deref().unwrap_or("any"),
-                Style::default().fg(theme.text),
+                Style::default().fg(c.text),
             ),
         ]),
         Line::from(vec![
-            Span::styled("Search ", Style::default().fg(theme.muted)),
+            Span::styled("Search ", Style::default().fg(c.muted)),
             Span::styled(
                 if app.filters.search.is_empty() {
                     "off"
                 } else {
                     app.filters.search.as_str()
                 },
-                Style::default().fg(theme.text),
+                Style::default().fg(c.text),
             ),
         ]),
         Line::default(),
         Line::from(vec![Span::styled(
             "Agenda",
-            Style::default()
-                .fg(theme.accent)
-                .add_modifier(Modifier::BOLD),
+            Style::default().fg(c.accent).add_modifier(Modifier::BOLD),
         )]),
         Line::from(vec![
-            Span::styled("Today  ", Style::default().fg(theme.muted)),
+            Span::styled("Today  ", Style::default().fg(c.muted)),
             Span::styled(
                 app.issues
                     .iter()
@@ -143,28 +200,30 @@ fn draw_sidebar(frame: &mut Frame, area: Rect, app: &App) {
                     })
                     .count()
                     .to_string(),
-                Style::default().fg(theme.text),
+                Style::default().fg(c.text),
             ),
         ]),
         Line::from(vec![
-            Span::styled("Picked ", Style::default().fg(theme.muted)),
+            Span::styled("Picked ", Style::default().fg(c.muted)),
             Span::styled(
                 selected_issue
                     .map(|iid| format!("#{iid}"))
-                    .unwrap_or_else(|| "none".to_string()),
-                Style::default().fg(theme.text),
+                    .unwrap_or_else(|| String::from("none")),
+                Style::default().fg(c.text),
             ),
         ]),
     ];
 
-    let sidebar = Paragraph::new(Text::from(lines))
-        .style(Style::default().bg(theme.panel).fg(theme.text))
-        .block(styled_block(theme, "glissues"));
-    frame.render_widget(sidebar, area);
+    frame.render_widget(
+        Paragraph::new(Text::from(lines))
+            .style(Style::default().bg(c.panel).fg(c.text))
+            .block(styled_block(c, "glissues")),
+        area,
+    );
 }
 
 fn draw_issue_list(frame: &mut Frame, area: Rect, app: &App) {
-    let theme = &app.theme;
+    let c = colors(app.theme.palette());
     let visible = app.visible_issue_indices();
     let mut items = Vec::new();
 
@@ -176,18 +235,18 @@ fn draw_issue_list(frame: &mut Frame, area: Rect, app: &App) {
             "○"
         };
         let state_style = if issue.state == "opened" {
-            Style::default().fg(theme.accent_alt)
+            Style::default().fg(c.accent_alt)
         } else {
-            Style::default().fg(theme.muted)
+            Style::default().fg(c.muted)
         };
 
         let status = app
             .issue_status(issue)
-            .unwrap_or_else(|| "status::none".to_string());
+            .unwrap_or_else(|| String::from("status::none"));
         let due = issue
             .due_date
             .clone()
-            .unwrap_or_else(|| "no due".to_string());
+            .unwrap_or_else(|| String::from("no due"));
         let labels = issue
             .labels
             .iter()
@@ -198,10 +257,10 @@ fn draw_issue_list(frame: &mut Frame, area: Rect, app: &App) {
             .join(", ");
 
         let meta = if labels.is_empty() {
-            format!("{}  {}  {} notes", status, due, issue.user_notes_count)
+            format!("{}  {}  {} comments", status, due, issue.user_notes_count)
         } else {
             format!(
-                "{}  {}  {}  {} notes",
+                "{}  {}  {}  {} comments",
                 status, due, labels, issue.user_notes_count
             )
         };
@@ -211,26 +270,26 @@ fn draw_issue_list(frame: &mut Frame, area: Rect, app: &App) {
                 Span::styled(format!("{state_marker} "), state_style),
                 Span::styled(
                     format!("#{} {}", issue.iid, issue.title),
-                    Style::default().fg(theme.text).add_modifier(Modifier::BOLD),
+                    Style::default().fg(c.text).add_modifier(Modifier::BOLD),
                 ),
             ]),
-            Line::from(Span::styled(meta, Style::default().fg(theme.muted))),
+            Line::from(Span::styled(meta, Style::default().fg(c.muted))),
         ]));
     }
 
     if items.is_empty() {
         items.push(ListItem::new(Line::from(Span::styled(
             "No issues match the current filters.",
-            Style::default().fg(theme.muted),
+            Style::default().fg(c.muted),
         ))));
     }
 
     let list = List::new(items)
-        .block(pane_block(theme, "Issues", true))
+        .block(pane_block(c, "Issues", true))
         .highlight_style(
             Style::default()
-                .bg(theme.panel_alt)
-                .fg(theme.text)
+                .bg(c.panel_alt)
+                .fg(c.text)
                 .add_modifier(Modifier::BOLD),
         )
         .highlight_symbol("▎");
@@ -243,142 +302,18 @@ fn draw_issue_list(frame: &mut Frame, area: Rect, app: &App) {
 }
 
 fn draw_preview(frame: &mut Frame, area: Rect, app: &App) {
-    let theme = &app.theme;
-    let content = preview_text(app);
-
-    let preview = Paragraph::new(content)
-        .block(styled_block(theme, "Preview"))
-        .style(Style::default().bg(theme.panel).fg(theme.text))
-        .wrap(Wrap { trim: false });
-    frame.render_widget(preview, area);
-}
-
-fn preview_text(app: &App) -> Text<'static> {
-    let theme = &app.theme;
-    if let Some(issue) = app.selected_issue() {
-        let mut lines = vec![
-            Line::from(vec![
-                Span::styled(
-                    format!("#{}", issue.iid),
-                    Style::default()
-                        .fg(theme.accent)
-                        .add_modifier(Modifier::BOLD),
-                ),
-                Span::raw(" "),
-                Span::styled(
-                    issue.title.clone(),
-                    Style::default().fg(theme.text).add_modifier(Modifier::BOLD),
-                ),
-            ]),
-            Line::from(vec![
-                Span::styled("State  ", Style::default().fg(theme.muted)),
-                Span::styled(issue.state.clone(), Style::default().fg(theme.text)),
-                Span::raw("    "),
-                Span::styled("Status  ", Style::default().fg(theme.muted)),
-                Span::styled(
-                    app.issue_status(issue)
-                        .unwrap_or_else(|| "status::none".to_string()),
-                    Style::default().fg(theme.text),
-                ),
-            ]),
-            Line::from(vec![
-                Span::styled("Due    ", Style::default().fg(theme.muted)),
-                Span::styled(
-                    issue.due_date.clone().unwrap_or_else(|| "none".to_string()),
-                    due_style(issue, theme),
-                ),
-                Span::raw("    "),
-                Span::styled("Updated  ", Style::default().fg(theme.muted)),
-                Span::styled(
-                    format_timestamp(&issue.updated_at),
-                    Style::default().fg(theme.text),
-                ),
-            ]),
-            Line::from(vec![
-                Span::styled("Labels ", Style::default().fg(theme.muted)),
-                Span::styled(
-                    if issue.labels.is_empty() {
-                        "none".to_string()
-                    } else {
-                        issue.labels.join(", ")
-                    },
-                    Style::default().fg(theme.text),
-                ),
-            ]),
-            Line::from(vec![
-                Span::styled("URL    ", Style::default().fg(theme.muted)),
-                Span::styled(issue.web_url.clone(), Style::default().fg(theme.link)),
-            ]),
-            Line::default(),
-            Line::from(Span::styled(
-                "Description",
-                Style::default()
-                    .fg(theme.accent)
-                    .add_modifier(Modifier::BOLD),
-            )),
-        ];
-
-        let body = render_markdown(&issue.description, theme);
-        lines.extend(body.lines);
-        lines.push(Line::default());
-        lines.push(Line::from(Span::styled(
-            "Comments",
-            Style::default()
-                .fg(theme.accent)
-                .add_modifier(Modifier::BOLD),
-        )));
-
-        match app.selected_notes() {
-            Some(notes) if notes.is_empty() => lines.push(Line::from(Span::styled(
-                "No comments yet.",
-                Style::default().fg(theme.muted),
-            ))),
-            Some(notes) => {
-                for note in notes {
-                    let author = note
-                        .author
-                        .as_ref()
-                        .map(|author| {
-                            if author.name.is_empty() {
-                                author.username.clone()
-                            } else {
-                                author.name.clone()
-                            }
-                        })
-                        .unwrap_or_else(|| "unknown".to_string());
-                    lines.push(Line::from(vec![
-                        Span::styled(
-                            author,
-                            Style::default().fg(theme.warn).add_modifier(Modifier::BOLD),
-                        ),
-                        Span::raw("  "),
-                        Span::styled(
-                            format_timestamp(&note.created_at),
-                            Style::default().fg(theme.muted),
-                        ),
-                    ]));
-                    let markdown = render_markdown(&note.body, theme);
-                    lines.extend(markdown.lines);
-                    lines.push(Line::default());
-                }
-            }
-            None => lines.push(Line::from(Span::styled(
-                "Comments are loading...",
-                Style::default().fg(theme.muted),
-            ))),
-        }
-
-        Text::from(lines)
-    } else {
-        Text::from(vec![Line::from(Span::styled(
-            "Select an issue to inspect it.",
-            Style::default().fg(theme.muted),
-        ))])
-    }
+    let c = colors(app.theme.palette());
+    frame.render_widget(
+        Paragraph::new(issue_text(app, false))
+            .block(styled_block(c, "Preview"))
+            .style(Style::default().bg(c.panel).fg(c.text))
+            .wrap(Wrap { trim: false }),
+        area,
+    );
 }
 
 fn draw_footer(frame: &mut Frame, area: Rect, app: &App) {
-    let theme = &app.theme;
+    let c = colors(app.theme.palette());
     let prompt = match app.mode {
         Mode::Search => format!("/{}", app.search_input),
         Mode::Command => format!(":{}", app.command_input),
@@ -387,11 +322,14 @@ fn draw_footer(frame: &mut Frame, area: Rect, app: &App) {
 
     let hints = match app.mode {
         Mode::Normal => {
-            " Enter open issue  Tab state filter  j/k move  n new  e edit  l/s filters  : command  Ctrl-c quit "
+            " j/k move  Tab state filter  Enter details  b add blocker  B remove blocker  t themes  n new  e edit  Ctrl-r refresh "
         }
         Mode::IssueView => {
-            " Esc close issue  j/k or arrows scroll  mouse wheel scroll  gg/G jump  Ctrl-u/Ctrl-d fast scroll "
+            " Esc close  e edit  c comment  a labels  b add blocker  B remove blocker  t themes  S status  d due  x close  D delete "
         }
+        Mode::ConfirmDelete => " y or Enter confirm delete  n or Esc cancel ",
+        Mode::BlockerPicker => " type to search  Enter apply  Esc cancel ",
+        Mode::ThemePicker => " h/Left prev  l/Right next  Enter or Esc close ",
         Mode::Search => " Enter apply  Esc cancel ",
         Mode::Command => " Enter run command  Esc cancel ",
         _ => " Esc close overlay  Ctrl-s save while editing ",
@@ -403,89 +341,132 @@ fn draw_footer(frame: &mut Frame, area: Rect, app: &App) {
         .split(area);
 
     frame.render_widget(
-        Paragraph::new(prompt).style(Style::default().bg(theme.panel_alt).fg(theme.text)),
+        Paragraph::new(prompt).style(Style::default().bg(c.panel_alt).fg(c.text)),
         rows[0],
     );
     frame.render_widget(
-        Paragraph::new(hints).style(Style::default().bg(theme.bg).fg(theme.muted)),
+        Paragraph::new(hints).style(Style::default().bg(c.bg).fg(c.muted)),
         rows[1],
     );
 }
 
 fn draw_help(frame: &mut Frame, area: Rect, app: &App) {
-    let theme = &app.theme;
-    let popup = centered_rect(72, 60, area);
+    let c = colors(app.theme.palette());
+    let popup = centered_rect(76, 68, area);
     let text = Text::from(vec![
         Line::from(Span::styled(
             "glissues keymap",
-            Style::default()
-                .fg(theme.accent)
-                .add_modifier(Modifier::BOLD),
+            Style::default().fg(c.accent).add_modifier(Modifier::BOLD),
         )),
         Line::default(),
-        Line::from("j/k or arrows  move through the issue list"),
-        Line::from("Enter          open the selected issue in a popup"),
-        Line::from("Esc            leave the issue popup or close overlays"),
-        Line::from("mouse wheel    move the list or scroll the open issue"),
+        Line::from("j / k          move through the issue list"),
         Line::from("gg / G         jump to top or bottom"),
-        Line::from("Ctrl-u / Ctrl-d scroll the open issue faster"),
+        Line::from("Enter          open the selected issue popup"),
+        Line::from("Esc            close the issue popup or overlays"),
+        Line::from("Tab            cycle all/open/closed filters"),
+        Line::from("Ctrl-r         refresh from GitLab with spinner"),
+        Line::from("t              open the theme selector"),
+        Line::from("F or l         filter by label"),
+        Line::from("s              filter by status"),
+        Line::from("/              fuzzy-like text filter"),
         Line::from("n              create a new issue"),
         Line::from("e              edit title and body"),
-        Line::from("x              close or reopen the selected issue"),
         Line::from("c              add a comment"),
-        Line::from("L              edit labels with autocomplete"),
-        Line::from("S              set workflow status label"),
+        Line::from("a              edit labels"),
+        Line::from("b / B          add or remove blockers"),
+        Line::from("S              set issue status directly"),
         Line::from("d              open the due date picker"),
-        Line::from("Tab            cycle all/open/closed filters"),
-        Line::from("l / s          filter by label or status"),
-        Line::from("/              fuzzy-like text filter"),
-        Line::from(":              run quick commands like :refresh or :filter open"),
+        Line::from("x              close or reopen the selected issue"),
+        Line::from("D              delete the selected issue after confirmation"),
+        Line::from(
+            "Inside popup   e edit, c comment, a labels, b/B blockers, S status, d due, x close/reopen, H/L move, D delete",
+        ),
+        Line::from(
+            "Inside editors type # to mention an issue, Enter to insert #iid, or Esc to skip",
+        ),
+        Line::from(":              run commands like :refresh or :filter open"),
         Line::from("Ctrl-c         quit instantly"),
         Line::default(),
         Line::from(Span::styled(
-            "Editor mode",
-            Style::default()
-                .fg(theme.accent)
-                .add_modifier(Modifier::BOLD),
+            "Editors",
+            Style::default().fg(c.accent).add_modifier(Modifier::BOLD),
         )),
-        Line::from("i              enter insert mode"),
-        Line::from("Esc            leave insert mode"),
+        Line::from("Typing         always inserts text"),
+        Line::from("Esc            close the editor or comment popup"),
         Line::from("Tab            switch between title/body fields"),
         Line::from("Ctrl-s         save changes"),
-        Line::from("q              cancel the current overlay"),
     ]);
 
     frame.render_widget(Clear, popup);
     frame.render_widget(
         Paragraph::new(text)
-            .block(styled_block(theme, "Help"))
-            .style(Style::default().bg(theme.panel).fg(theme.text))
+            .block(styled_block(c, "Help"))
+            .style(Style::default().bg(c.panel).fg(c.text))
             .wrap(Wrap { trim: false }),
         popup,
     );
 }
 
 fn draw_issue_view(frame: &mut Frame, area: Rect, app: &mut App) {
-    let theme = app.theme;
-    let popup = centered_rect(82, 86, area);
-    let content = preview_text(app);
+    let c = colors(app.theme.palette());
+    let popup = centered_rect(86, 88, area);
+    let content = issue_text(app, true);
     let inner = Block::default().borders(Borders::ALL).inner(popup);
     let content_height = wrapped_text_height(&content, inner.width);
-    app.sync_issue_view_layout(popup, inner.height, content_height);
+    app.sync_issue_view_layout(inner.height, content_height);
 
     frame.render_widget(Clear, popup);
     frame.render_widget(
         Paragraph::new(content)
-            .block(pane_block(&theme, "Issue", true))
-            .style(Style::default().bg(theme.panel).fg(theme.text))
+            .block(pane_block(c, "Issue", true))
+            .style(Style::default().bg(c.panel).fg(c.text))
             .wrap(Wrap { trim: false })
             .scroll((app.issue_view_scroll, 0)),
         popup,
     );
 }
 
+fn draw_confirm_delete(frame: &mut Frame, area: Rect, app: &App) {
+    let c = colors(app.theme.palette());
+    let Some(confirm) = app.delete_confirmation.as_ref() else {
+        return;
+    };
+
+    let popup = centered_rect(56, 28, area);
+    let text = Text::from(vec![
+        Line::from(Span::styled(
+            "Delete issue?",
+            Style::default().fg(c.danger).add_modifier(Modifier::BOLD),
+        )),
+        Line::default(),
+        Line::from(vec![
+            Span::styled(format!("#{} ", confirm.iid), Style::default().fg(c.accent)),
+            Span::styled(confirm.title.clone(), Style::default().fg(c.text)),
+        ]),
+        Line::default(),
+        Line::from(Span::styled(
+            "This permanently removes the issue from GitLab.",
+            Style::default().fg(c.warn),
+        )),
+        Line::default(),
+        Line::from(Span::styled(
+            "Press y or Enter to delete, n or Esc to cancel.",
+            Style::default().fg(c.muted),
+        )),
+    ]);
+
+    frame.render_widget(Clear, popup);
+    frame.render_widget(
+        Paragraph::new(text)
+            .block(pane_block(c, "Confirm Delete", true))
+            .style(Style::default().bg(c.panel).fg(c.text))
+            .wrap(Wrap { trim: false }),
+        popup,
+    );
+}
+
 fn draw_issue_editor(frame: &mut Frame, area: Rect, app: &App) {
-    let theme = &app.theme;
+    let c = colors(app.theme.palette());
     let Some(editor) = app.issue_editor.as_ref() else {
         return;
     };
@@ -510,69 +491,59 @@ fn draw_issue_editor(frame: &mut Frame, area: Rect, app: &App) {
             } else {
                 "New Issue"
             })
-            .style(Style::default().bg(theme.panel).fg(theme.text)),
+            .style(Style::default().bg(c.panel).fg(c.text)),
         popup,
     );
 
     let title_style = if matches!(editor.focus, EditorField::Title) {
-        Style::default().fg(theme.text).bg(theme.panel_alt)
+        Style::default().fg(c.text).bg(c.panel_alt)
     } else {
-        Style::default().fg(theme.text).bg(theme.panel)
+        Style::default().fg(c.text).bg(c.panel)
     };
     let body_style = if matches!(editor.focus, EditorField::Body) {
-        Style::default().fg(theme.text).bg(theme.panel_alt)
+        Style::default().fg(c.text).bg(c.panel_alt)
     } else {
-        Style::default().fg(theme.text).bg(theme.panel)
+        Style::default().fg(c.text).bg(c.panel)
     };
 
     frame.render_widget(
         Paragraph::new(editor.title.to_text())
-            .block(styled_block(theme, "Title"))
+            .block(styled_block(c, "Title"))
             .style(title_style),
         sections[0],
     );
     frame.render_widget(
         Paragraph::new(editor.body.to_text())
-            .block(styled_block(theme, "Body (Markdown)"))
+            .block(styled_block(c, "Body (Markdown)"))
             .style(body_style)
-            .wrap(Wrap { trim: false }),
+            .wrap(Wrap { trim: false })
+            .scroll((editor_scroll(&editor.body, sections[1]), 0)),
         sections[1],
     );
     frame.render_widget(
-        Paragraph::new(format!(
-            "{}  i insert  Esc normal  Tab next field  Ctrl-s save  q cancel",
-            if matches!(editor.mode, crate::editor::EditMode::Insert) {
-                "INSERT"
-            } else {
-                "NORMAL"
-            }
-        ))
-        .style(Style::default().fg(theme.muted).bg(theme.panel)),
+        Paragraph::new("Esc close draft  Tab next field  Ctrl-s save  # mention issue")
+            .style(Style::default().fg(c.muted).bg(c.panel)),
         sections[2],
     );
 
-    if matches!(editor.mode, crate::editor::EditMode::Insert) {
-        match editor.focus {
-            EditorField::Title => {
-                let inner = Block::default().borders(Borders::ALL).inner(sections[0]);
-                frame.set_cursor_position((
-                    inner.x + editor.title.col() as u16,
-                    inner.y + editor.title.row() as u16,
-                ));
-            }
-            EditorField::Body => {
-                let inner = Block::default().borders(Borders::ALL).inner(sections[1]);
-                frame.set_cursor_position((
-                    inner.x + editor.body.col() as u16,
-                    inner.y + editor.body.row() as u16,
-                ));
-            }
+    match editor.focus {
+        EditorField::Title => {
+            let inner = Block::default().borders(Borders::ALL).inner(sections[0]);
+            frame.set_cursor_position((
+                inner.x + editor.title.col() as u16,
+                inner.y + editor.title.row() as u16,
+            ));
+        }
+        EditorField::Body => {
+            let inner = Block::default().borders(Borders::ALL).inner(sections[1]);
+            let (_, cursor_x, cursor_y) = editor_viewport(&editor.body, inner.width, inner.height);
+            frame.set_cursor_position((inner.x + cursor_x, inner.y + cursor_y));
         }
     }
 }
 
 fn draw_comment_editor(frame: &mut Frame, area: Rect, app: &App) {
-    let theme = &app.theme;
+    let c = colors(app.theme.palette());
     let Some(editor) = app.comment_editor.as_ref() else {
         return;
     };
@@ -589,33 +560,30 @@ fn draw_comment_editor(frame: &mut Frame, area: Rect, app: &App) {
         Block::default()
             .borders(Borders::ALL)
             .title("New Comment")
-            .style(Style::default().bg(theme.panel).fg(theme.text)),
+            .style(Style::default().bg(c.panel).fg(c.text)),
         popup,
     );
     frame.render_widget(
         Paragraph::new(editor.body.to_text())
-            .block(styled_block(theme, "Body"))
-            .style(Style::default().bg(theme.panel_alt).fg(theme.text))
-            .wrap(Wrap { trim: false }),
+            .block(styled_block(c, "Body"))
+            .style(Style::default().bg(c.panel_alt).fg(c.text))
+            .wrap(Wrap { trim: false })
+            .scroll((editor_scroll(&editor.body, inner[0]), 0)),
         inner[0],
     );
     frame.render_widget(
-        Paragraph::new("i insert  Esc normal  Ctrl-s save  q cancel")
-            .style(Style::default().fg(theme.muted).bg(theme.panel)),
+        Paragraph::new("Esc close draft  Ctrl-s save  # mention issue")
+            .style(Style::default().fg(c.muted).bg(c.panel)),
         inner[1],
     );
 
-    if matches!(editor.mode, crate::editor::EditMode::Insert) {
-        let cursor = Block::default().borders(Borders::ALL).inner(inner[0]);
-        frame.set_cursor_position((
-            cursor.x + editor.body.col() as u16,
-            cursor.y + editor.body.row() as u16,
-        ));
-    }
+    let cursor = Block::default().borders(Borders::ALL).inner(inner[0]);
+    let (_, cursor_x, cursor_y) = editor_viewport(&editor.body, cursor.width, cursor.height);
+    frame.set_cursor_position((cursor.x + cursor_x, cursor.y + cursor_y));
 }
 
 fn draw_label_editor(frame: &mut Frame, area: Rect, app: &App) {
-    let theme = &app.theme;
+    let c = colors(app.theme.palette());
     let Some(picker) = app.label_picker.as_ref() else {
         return;
     };
@@ -652,13 +620,13 @@ fn draw_label_editor(frame: &mut Frame, area: Rect, app: &App) {
         Block::default()
             .borders(Borders::ALL)
             .title("Edit Labels")
-            .style(Style::default().bg(theme.panel).fg(theme.text)),
+            .style(Style::default().bg(c.panel).fg(c.text)),
         popup,
     );
     frame.render_widget(
         Paragraph::new(picker.query.as_str())
-            .block(styled_block(theme, "Search or Create"))
-            .style(Style::default().bg(theme.panel_alt).fg(theme.text)),
+            .block(styled_block(c, "Search or Create"))
+            .style(Style::default().bg(c.panel_alt).fg(c.text)),
         sections[0],
     );
     frame.render_widget(
@@ -670,15 +638,15 @@ fn draw_label_editor(frame: &mut Frame, area: Rect, app: &App) {
                 .collect::<Vec<_>>()
                 .join("  "),
         )
-        .block(styled_block(theme, "Selected"))
-        .style(Style::default().bg(theme.panel).fg(theme.text))
+        .block(styled_block(c, "Selected"))
+        .style(Style::default().bg(c.panel).fg(c.text))
         .wrap(Wrap { trim: false }),
         sections[1],
     );
     let list = List::new(items)
-        .block(styled_block(theme, "Autocomplete"))
+        .block(styled_block(c, "Autocomplete"))
         .highlight_symbol("▎")
-        .highlight_style(Style::default().bg(theme.panel_alt).fg(theme.text));
+        .highlight_style(Style::default().bg(c.panel_alt).fg(c.text));
     let mut state = ListState::default();
     if !filtered.is_empty() {
         state.select(Some(picker.cursor.min(filtered.len() - 1)));
@@ -686,13 +654,13 @@ fn draw_label_editor(frame: &mut Frame, area: Rect, app: &App) {
     frame.render_stateful_widget(list, sections[2], &mut state);
     frame.render_widget(
         Paragraph::new("type to filter  Space toggle  Enter save  Esc cancel")
-            .style(Style::default().fg(theme.muted).bg(theme.panel)),
+            .style(Style::default().fg(c.muted).bg(c.panel)),
         sections[3],
     );
 }
 
 fn draw_selector(frame: &mut Frame, area: Rect, app: &App) {
-    let theme = &app.theme;
+    let c = colors(app.theme.palette());
     let Some(selector) = app.selector.as_ref() else {
         return;
     };
@@ -726,19 +694,19 @@ fn draw_selector(frame: &mut Frame, area: Rect, app: &App) {
         Block::default()
             .borders(Borders::ALL)
             .title(selector.title.as_str())
-            .style(Style::default().bg(theme.panel).fg(theme.text)),
+            .style(Style::default().bg(c.panel).fg(c.text)),
         popup,
     );
     frame.render_widget(
         Paragraph::new(selector.query.as_str())
-            .block(styled_block(theme, "Filter"))
-            .style(Style::default().bg(theme.panel_alt).fg(theme.text)),
+            .block(styled_block(c, "Filter"))
+            .style(Style::default().bg(c.panel_alt).fg(c.text)),
         sections[0],
     );
     let list = List::new(items)
-        .block(styled_block(theme, "Options"))
+        .block(styled_block(c, "Options"))
         .highlight_symbol("▎")
-        .highlight_style(Style::default().bg(theme.panel_alt).fg(theme.text));
+        .highlight_style(Style::default().bg(c.panel_alt).fg(c.text));
     let mut state = ListState::default();
     if !filtered.is_empty() {
         state.select(Some(selector.cursor.min(filtered.len() - 1)));
@@ -750,13 +718,188 @@ fn draw_selector(frame: &mut Frame, area: Rect, app: &App) {
         } else {
             "type to filter  Enter apply  Esc cancel"
         })
-        .style(Style::default().fg(theme.muted).bg(theme.panel)),
+        .style(Style::default().fg(c.muted).bg(c.panel)),
         sections[2],
     );
 }
 
+fn draw_mention_picker(frame: &mut Frame, area: Rect, app: &App) {
+    let c = colors(app.theme.palette());
+    let Some(picker) = app.mention_picker.as_ref() else {
+        return;
+    };
+
+    let popup = centered_rect(60, 52, area);
+    let sections = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(3),
+            Constraint::Min(8),
+            Constraint::Length(1),
+        ])
+        .margin(1)
+        .split(popup);
+
+    let candidates = app.mention_candidates();
+    let mut items = Vec::new();
+    for index in &candidates {
+        if let Some(issue) = app.issues.get(*index) {
+            items.push(ListItem::new(vec![
+                Line::from(vec![
+                    Span::styled(format!("#{} ", issue.iid), Style::default().fg(c.accent)),
+                    Span::styled(issue.title.clone(), Style::default().fg(c.text)),
+                ]),
+                Line::from(Span::styled(
+                    issue.state.clone(),
+                    Style::default().fg(c.muted),
+                )),
+            ]));
+        }
+    }
+
+    if items.is_empty() {
+        items.push(ListItem::new(Line::from(Span::styled(
+            "No matching issues.",
+            Style::default().fg(c.muted),
+        ))));
+    }
+
+    frame.render_widget(Clear, popup);
+    frame.render_widget(
+        Block::default()
+            .borders(Borders::ALL)
+            .title("Mention Issue")
+            .style(Style::default().bg(c.panel).fg(c.text)),
+        popup,
+    );
+    frame.render_widget(
+        Paragraph::new(format!("#{}", picker.query))
+            .block(styled_block(c, "Query"))
+            .style(Style::default().bg(c.panel_alt).fg(c.text)),
+        sections[0],
+    );
+
+    let list = List::new(items)
+        .block(styled_block(c, "Matches"))
+        .highlight_symbol("▎")
+        .highlight_style(
+            Style::default()
+                .bg(c.panel_alt)
+                .fg(c.text)
+                .add_modifier(Modifier::BOLD),
+        );
+    let mut state = ListState::default();
+    if !candidates.is_empty() {
+        state.select(Some(picker.cursor.min(candidates.len() - 1)));
+    }
+    frame.render_stateful_widget(list, sections[1], &mut state);
+    frame.render_widget(
+        Paragraph::new("type to search  Enter choose  Esc keep # and continue")
+            .style(Style::default().fg(c.muted).bg(c.panel)),
+        sections[2],
+    );
+}
+
+fn draw_blocker_picker(frame: &mut Frame, area: Rect, app: &App) {
+    let c = colors(app.theme.palette());
+    let Some(picker) = app.blocker_picker.as_ref() else {
+        return;
+    };
+
+    let popup = centered_rect(62, 56, area);
+    let sections = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(3),
+            Constraint::Min(8),
+            Constraint::Length(1),
+        ])
+        .margin(1)
+        .split(popup);
+
+    let candidates = app.blocker_candidates();
+    let mut items = Vec::new();
+    for candidate in &candidates {
+        items.push(ListItem::new(vec![
+            Line::from(vec![
+                Span::styled(
+                    format!("#{} ", candidate.iid),
+                    Style::default().fg(c.accent),
+                ),
+                Span::styled(candidate.title.clone(), Style::default().fg(c.text)),
+            ]),
+            Line::from(Span::styled(
+                candidate.state.clone(),
+                Style::default().fg(c.muted),
+            )),
+        ]));
+    }
+
+    if items.is_empty() {
+        items.push(ListItem::new(Line::from(Span::styled(
+            if picker.action == crate::app::BlockerAction::Add {
+                "No matching issues to add as blockers."
+            } else {
+                "No blockers to remove."
+            },
+            Style::default().fg(c.muted),
+        ))));
+    }
+
+    let title = if picker.action == crate::app::BlockerAction::Add {
+        "Add Blocker"
+    } else {
+        "Remove Blocker"
+    };
+
+    frame.render_widget(Clear, popup);
+    frame.render_widget(
+        Block::default()
+            .borders(Borders::ALL)
+            .title(title)
+            .style(Style::default().bg(c.panel).fg(c.text)),
+        popup,
+    );
+    frame.render_widget(
+        Paragraph::new(picker.query.as_str())
+            .block(styled_block(c, "Search"))
+            .style(Style::default().bg(c.panel_alt).fg(c.text)),
+        sections[0],
+    );
+
+    let list = List::new(items)
+        .block(styled_block(c, "Matches"))
+        .highlight_symbol("▎")
+        .highlight_style(
+            Style::default()
+                .bg(c.panel_alt)
+                .fg(c.text)
+                .add_modifier(Modifier::BOLD),
+        );
+    let mut state = ListState::default();
+    if !candidates.is_empty() {
+        state.select(Some(picker.cursor.min(candidates.len() - 1)));
+    }
+    frame.render_stateful_widget(list, sections[1], &mut state);
+    frame.render_widget(
+        Paragraph::new("type to search  Enter apply  Esc cancel")
+            .style(Style::default().fg(c.muted).bg(c.panel)),
+        sections[2],
+    );
+}
+
+fn draw_theme_picker(frame: &mut Frame, area: Rect, app: &App) {
+    let popup = centered_rect(56, 38, area);
+    let picker = ThemePicker::new(app.theme.name)
+        .title("Theme Selector")
+        .instructions("Prev <h/Left> Next <l/Right> Close <Esc>");
+
+    frame.render_widget(Clear, popup);
+    frame.render_widget(picker, popup);
+}
+
 fn draw_due_date_picker(frame: &mut Frame, area: Rect, app: &App) {
-    let theme = &app.theme;
+    let c = colors(app.theme.palette());
     let Some(picker) = app.due_date_picker.as_ref() else {
         return;
     };
@@ -777,47 +920,271 @@ fn draw_due_date_picker(frame: &mut Frame, area: Rect, app: &App) {
         Block::default()
             .borders(Borders::ALL)
             .title("Due Date")
-            .style(Style::default().bg(theme.panel).fg(theme.text)),
+            .style(Style::default().bg(c.panel).fg(c.text)),
         popup,
     );
 
-    let title = Paragraph::new(format!(
-        "{} {}",
-        month_name(picker.month.month()),
-        picker.month.year()
-    ))
-    .style(
-        Style::default()
-            .fg(theme.accent)
-            .bg(theme.panel)
-            .add_modifier(Modifier::BOLD),
+    frame.render_widget(
+        Paragraph::new(format!(
+            "{} {}",
+            month_name(picker.month.month()),
+            picker.month.year()
+        ))
+        .style(
+            Style::default()
+                .fg(c.accent)
+                .bg(c.panel)
+                .add_modifier(Modifier::BOLD),
+        ),
+        sections[0],
     );
-    frame.render_widget(title, sections[0]);
 
-    let calendar = Paragraph::new(calendar_text(picker, theme))
-        .style(Style::default().fg(theme.text).bg(theme.panel))
-        .wrap(Wrap { trim: false });
-    frame.render_widget(calendar, sections[1]);
+    frame.render_widget(
+        Paragraph::new(calendar_text(picker, c))
+            .style(Style::default().fg(c.text).bg(c.panel))
+            .wrap(Wrap { trim: false }),
+        sections[1],
+    );
 
-    let info = Paragraph::new(format!("Selected: {}", picker.selected.format("%Y-%m-%d")))
-        .style(Style::default().fg(theme.text).bg(theme.panel_alt));
-    frame.render_widget(info, sections[2]);
+    frame.render_widget(
+        Paragraph::new(format!("Selected: {}", picker.selected.format("%Y-%m-%d")))
+            .style(Style::default().fg(c.text).bg(c.panel_alt)),
+        sections[2],
+    );
     frame.render_widget(
         Paragraph::new("h/j/k/l move  H/L month  t today  Enter save  x clear")
-            .style(Style::default().fg(theme.muted).bg(theme.panel)),
+            .style(Style::default().fg(c.muted).bg(c.panel)),
         sections[3],
     );
 }
 
-fn calendar_text(picker: &DueDatePickerState, theme: &crate::theme::Theme) -> Text<'static> {
+fn draw_loading(frame: &mut Frame, area: Rect, app: &App) {
+    let c = colors(app.theme.palette());
+    let popup = centered_rect(34, 16, area);
+    let message = app.loading_message().unwrap_or("Loading GitLab data");
+    let text = Text::from(vec![
+        Line::default(),
+        Line::from(vec![
+            Span::styled(
+                app.spinner_frame(),
+                Style::default().fg(c.accent).add_modifier(Modifier::BOLD),
+            ),
+            Span::raw("  "),
+            Span::styled(
+                message,
+                Style::default().fg(c.text).add_modifier(Modifier::BOLD),
+            ),
+        ]),
+        Line::default(),
+        Line::from(Span::styled("Please wait...", Style::default().fg(c.muted))),
+    ]);
+
+    frame.render_widget(Clear, popup);
+    frame.render_widget(
+        Paragraph::new(text)
+            .block(pane_block(c, "Loading", true))
+            .style(Style::default().bg(c.panel).fg(c.text))
+            .wrap(Wrap { trim: false }),
+        popup,
+    );
+}
+
+fn draw_alert(frame: &mut Frame, area: Rect, app: &App) {
+    let c = colors(app.theme.palette());
+    let Some(alert) = app.alert.as_ref() else {
+        return;
+    };
+
+    let popup = centered_rect(70, 38, area);
+    let mut lines = vec![
+        Line::from(Span::styled(
+            alert.title.clone(),
+            Style::default().fg(c.danger).add_modifier(Modifier::BOLD),
+        )),
+        Line::default(),
+    ];
+    for line in alert.message.lines() {
+        lines.push(Line::from(line.to_string()));
+    }
+    lines.push(Line::default());
+    lines.push(Line::from(Span::styled(
+        "Press Enter, Esc, or q to dismiss.",
+        Style::default().fg(c.muted),
+    )));
+
+    frame.render_widget(Clear, popup);
+    frame.render_widget(
+        Paragraph::new(Text::from(lines))
+            .block(pane_block(c, "Alert", true))
+            .style(Style::default().bg(c.panel).fg(c.text))
+            .wrap(Wrap { trim: false }),
+        popup,
+    );
+}
+
+fn issue_text(app: &App, include_actions: bool) -> Text<'static> {
+    let c = colors(app.theme.palette());
+    if let Some(issue) = app.selected_issue() {
+        let mut lines = vec![
+            Line::from(vec![
+                Span::styled(
+                    format!("#{}", issue.iid),
+                    Style::default().fg(c.accent).add_modifier(Modifier::BOLD),
+                ),
+                Span::raw(" "),
+                Span::styled(
+                    issue.title.clone(),
+                    Style::default().fg(c.text).add_modifier(Modifier::BOLD),
+                ),
+            ]),
+            Line::from(vec![
+                Span::styled("State  ", Style::default().fg(c.muted)),
+                Span::styled(issue.state.clone(), Style::default().fg(c.text)),
+                Span::raw("    "),
+                Span::styled("Status  ", Style::default().fg(c.muted)),
+                Span::styled(
+                    app.issue_status(issue)
+                        .unwrap_or_else(|| String::from("status::none")),
+                    Style::default().fg(c.text),
+                ),
+            ]),
+            Line::from(vec![
+                Span::styled("Due    ", Style::default().fg(c.muted)),
+                Span::styled(
+                    issue
+                        .due_date
+                        .clone()
+                        .unwrap_or_else(|| String::from("none")),
+                    due_style(issue, c),
+                ),
+                Span::raw("    "),
+                Span::styled("Updated  ", Style::default().fg(c.muted)),
+                Span::styled(
+                    format_timestamp(&issue.updated_at),
+                    Style::default().fg(c.text),
+                ),
+            ]),
+            Line::from(vec![
+                Span::styled("Labels ", Style::default().fg(c.muted)),
+                Span::styled(
+                    if issue.labels.is_empty() {
+                        String::from("none")
+                    } else {
+                        issue.labels.join(", ")
+                    },
+                    Style::default().fg(c.text),
+                ),
+            ]),
+            Line::from(vec![
+                Span::styled("URL    ", Style::default().fg(c.muted)),
+                Span::styled(issue.web_url.clone(), Style::default().fg(c.info)),
+            ]),
+        ];
+
+        if include_actions {
+            lines.push(Line::from(vec![
+                Span::styled("Actions ", Style::default().fg(c.muted)),
+                Span::styled(
+                    "e edit  c comment  a labels  b add blocker  B remove blocker  S status  d due  x close/reopen  H/L move  D delete",
+                    Style::default().fg(c.text),
+                ),
+            ]));
+        }
+
+        lines.push(Line::default());
+        lines.push(Line::from(Span::styled(
+            "Blockers",
+            Style::default().fg(c.iris).add_modifier(Modifier::BOLD),
+        )));
+        let blockers = app.selected_blockers();
+        if blockers.is_empty() {
+            lines.push(Line::from(Span::styled(
+                "No blockers.",
+                Style::default().fg(c.muted),
+            )));
+        } else {
+            for blocker in blockers {
+                lines.push(Line::from(vec![
+                    Span::styled("- ", Style::default().fg(c.muted)),
+                    Span::styled(format!("#{}", blocker.iid), Style::default().fg(c.rose)),
+                    Span::raw(" "),
+                    Span::styled(blocker.title.clone(), Style::default().fg(c.text)),
+                ]));
+            }
+        }
+
+        lines.push(Line::default());
+        lines.push(Line::from(Span::styled(
+            "Description",
+            Style::default().fg(c.accent).add_modifier(Modifier::BOLD),
+        )));
+
+        let body = render_markdown(&issue.description, app.theme.palette());
+        lines.extend(body.lines);
+        lines.push(Line::default());
+        lines.push(Line::from(Span::styled(
+            "Comments",
+            Style::default().fg(c.accent).add_modifier(Modifier::BOLD),
+        )));
+
+        match app.selected_notes() {
+            Some(notes) if notes.is_empty() => lines.push(Line::from(Span::styled(
+                "No comments yet.",
+                Style::default().fg(c.muted),
+            ))),
+            Some(notes) => {
+                for note in notes {
+                    let author = note
+                        .author
+                        .as_ref()
+                        .map(|author| {
+                            if author.name.is_empty() {
+                                author.username.clone()
+                            } else {
+                                author.name.clone()
+                            }
+                        })
+                        .unwrap_or_else(|| String::from("unknown"));
+                    lines.push(Line::from(vec![
+                        Span::styled(
+                            author,
+                            Style::default().fg(c.warn).add_modifier(Modifier::BOLD),
+                        ),
+                        Span::raw("  "),
+                        Span::styled(
+                            format_timestamp(&note.created_at),
+                            Style::default().fg(c.muted),
+                        ),
+                    ]));
+                    let markdown = render_markdown(&note.body, app.theme.palette());
+                    lines.extend(markdown.lines);
+                    lines.push(Line::default());
+                }
+            }
+            None => lines.push(Line::from(Span::styled(
+                "Comments are loading...",
+                Style::default().fg(c.muted),
+            ))),
+        }
+
+        Text::from(lines)
+    } else {
+        Text::from(vec![Line::from(Span::styled(
+            "Select an issue to inspect it.",
+            Style::default().fg(c.muted),
+        ))])
+    }
+}
+
+fn calendar_text(picker: &DueDatePickerState, c: Colors) -> Text<'static> {
     let mut lines = vec![Line::from(vec![
-        Span::styled(" Mo ", Style::default().fg(theme.muted)),
-        Span::styled(" Tu ", Style::default().fg(theme.muted)),
-        Span::styled(" We ", Style::default().fg(theme.muted)),
-        Span::styled(" Th ", Style::default().fg(theme.muted)),
-        Span::styled(" Fr ", Style::default().fg(theme.muted)),
-        Span::styled(" Sa ", Style::default().fg(theme.muted)),
-        Span::styled(" Su ", Style::default().fg(theme.muted)),
+        Span::styled(" Mo ", Style::default().fg(c.muted)),
+        Span::styled(" Tu ", Style::default().fg(c.muted)),
+        Span::styled(" We ", Style::default().fg(c.muted)),
+        Span::styled(" Th ", Style::default().fg(c.muted)),
+        Span::styled(" Fr ", Style::default().fg(c.muted)),
+        Span::styled(" Sa ", Style::default().fg(c.muted)),
+        Span::styled(" Su ", Style::default().fg(c.muted)),
     ])];
 
     let first_weekday = picker.month.weekday().number_from_monday() - 1;
@@ -838,13 +1205,13 @@ fn calendar_text(picker: &DueDatePickerState, theme: &crate::theme::Theme) -> Te
                 .expect("valid calendar date");
             let style = if date == picker.selected {
                 Style::default()
-                    .bg(theme.accent)
-                    .fg(theme.bg)
+                    .bg(c.accent)
+                    .fg(c.bg)
                     .add_modifier(Modifier::BOLD)
             } else if date == today {
-                Style::default().fg(theme.warn).add_modifier(Modifier::BOLD)
+                Style::default().fg(c.warn).add_modifier(Modifier::BOLD)
             } else {
-                Style::default().fg(theme.text)
+                Style::default().fg(c.text)
             };
             spans.push(Span::styled(format!(" {day:>2} "), style));
             day += 1;
@@ -858,36 +1225,34 @@ fn calendar_text(picker: &DueDatePickerState, theme: &crate::theme::Theme) -> Te
     Text::from(lines)
 }
 
-fn due_style(issue: &crate::model::Issue, theme: &crate::theme::Theme) -> Style {
+fn due_style(issue: &crate::model::Issue, c: Colors) -> Style {
     if issue.state != "opened" {
-        return Style::default().fg(theme.muted);
+        return Style::default().fg(c.muted);
     }
 
     let today = Local::now().date_naive();
     match issue.due_date.as_deref().and_then(parse_due_date) {
-        Some(date) if date < today => Style::default()
-            .fg(theme.danger)
-            .add_modifier(Modifier::BOLD),
+        Some(date) if date < today => Style::default().fg(c.danger).add_modifier(Modifier::BOLD),
         Some(date) if date <= today + Duration::days(2) => {
-            Style::default().fg(theme.warn).add_modifier(Modifier::BOLD)
+            Style::default().fg(c.warn).add_modifier(Modifier::BOLD)
         }
-        Some(_) => Style::default().fg(theme.accent_alt),
-        None => Style::default().fg(theme.muted),
+        Some(_) => Style::default().fg(c.accent_alt),
+        None => Style::default().fg(c.muted),
     }
 }
 
-fn styled_block<'a>(theme: &crate::theme::Theme, title: &'a str) -> Block<'a> {
+fn styled_block<'a>(c: Colors, title: &'a str) -> Block<'a> {
     Block::default()
         .borders(Borders::ALL)
         .title(title)
-        .style(Style::default().bg(theme.panel).fg(theme.muted))
+        .style(Style::default().bg(c.panel).fg(c.muted))
 }
 
-fn pane_block<'a>(theme: &crate::theme::Theme, title: &'a str, active: bool) -> Block<'a> {
+fn pane_block<'a>(c: Colors, title: &'a str, active: bool) -> Block<'a> {
     let style = if active {
-        Style::default().bg(theme.panel).fg(theme.accent)
+        Style::default().bg(c.panel).fg(c.accent)
     } else {
-        Style::default().bg(theme.panel).fg(theme.muted)
+        Style::default().bg(c.panel).fg(c.muted)
     };
 
     Block::default()
@@ -912,6 +1277,41 @@ fn wrapped_text_height(text: &Text<'_>, width: u16) -> u16 {
         .sum()
 }
 
+fn editor_scroll(buffer: &TextBuffer, area: Rect) -> u16 {
+    let inner = Block::default().borders(Borders::ALL).inner(area);
+    let (scroll, _, _) = editor_viewport(buffer, inner.width, inner.height);
+    scroll
+}
+
+fn editor_viewport(buffer: &TextBuffer, width: u16, height: u16) -> (u16, u16, u16) {
+    let width = width.max(1) as usize;
+    let height = height.max(1) as usize;
+
+    let mut visual_row = 0usize;
+    for line in buffer.lines().iter().take(buffer.row()) {
+        visual_row += wrapped_line_rows(line, width);
+    }
+
+    let current_line = &buffer.lines()[buffer.row()];
+    let current_col = buffer.col().min(current_line.chars().count());
+    visual_row += current_col / width;
+    let visual_col = (current_col % width) as u16;
+
+    let scroll = visual_row.saturating_sub(height.saturating_sub(1));
+    let cursor_y = (visual_row - scroll) as u16;
+
+    (scroll as u16, visual_col, cursor_y)
+}
+
+fn wrapped_line_rows(line: &str, width: usize) -> usize {
+    let chars = line.chars().count();
+    if chars == 0 {
+        1
+    } else {
+        ((chars - 1) / width) + 1
+    }
+}
+
 fn centered_rect(percent_x: u16, percent_y: u16, area: Rect) -> Rect {
     let vertical = Layout::default()
         .direction(Direction::Vertical)
@@ -932,23 +1332,18 @@ fn centered_rect(percent_x: u16, percent_y: u16, area: Rect) -> Rect {
         .split(vertical[1])[1]
 }
 
-fn sidebar_line(
-    theme: &crate::theme::Theme,
-    label: &str,
-    count: usize,
-    active: bool,
-) -> Line<'static> {
+fn sidebar_line(c: Colors, label: &str, count: usize, active: bool) -> Line<'static> {
     let style = if active {
         Style::default()
-            .fg(theme.text)
-            .bg(theme.panel_alt)
+            .fg(c.text)
+            .bg(c.panel_alt)
             .add_modifier(Modifier::BOLD)
     } else {
-        Style::default().fg(theme.text)
+        Style::default().fg(c.text)
     };
     Line::from(vec![
         Span::styled(format!("{label:<8}"), style),
-        Span::styled(format!("{count:>4}"), Style::default().fg(theme.muted)),
+        Span::styled(format!("{count:>4}"), Style::default().fg(c.muted)),
     ])
 }
 

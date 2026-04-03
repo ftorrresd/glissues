@@ -4,12 +4,13 @@ use reqwest::header::{HeaderMap, HeaderValue};
 use serde::de::DeserializeOwned;
 
 use crate::config::AppConfig;
-use crate::model::{Issue, Note, ProjectLabel};
+use crate::model::{Issue, IssueLink, Note, ProjectLabel};
 
 #[derive(Debug, Clone)]
 pub struct GitLabClient {
     http: Client,
     project_api_base: String,
+    project_ref: String,
 }
 
 #[derive(Debug, Clone)]
@@ -53,6 +54,7 @@ impl GitLabClient {
         Ok(Self {
             http,
             project_api_base,
+            project_ref: config.project.clone(),
         })
     }
 
@@ -82,6 +84,10 @@ impl GitLabClient {
                 ("activity_filter", "only_comments".to_string()),
             ],
         )
+    }
+
+    pub fn list_issue_links(&self, issue_iid: u64) -> Result<Vec<IssueLink>> {
+        self.get_paginated(&format!("/issues/{issue_iid}/links"), &[])
     }
 
     pub fn create_issue(&self, draft: &IssueDraft) -> Result<Issue> {
@@ -156,6 +162,41 @@ impl GitLabClient {
             .context("GitLab rejected note creation")?
             .json::<Note>()
             .context("failed to decode note response")
+    }
+
+    pub fn delete_issue(&self, issue_iid: u64) -> Result<()> {
+        self.http
+            .delete(self.url(&format!("/issues/{issue_iid}")))
+            .send()
+            .context("failed to delete issue")?
+            .error_for_status()
+            .context("GitLab rejected issue deletion")?;
+        Ok(())
+    }
+
+    pub fn add_blocker(&self, issue_iid: u64, blocker_iid: u64) -> Result<()> {
+        self.http
+            .post(self.url(&format!("/issues/{issue_iid}/links")))
+            .form(&[
+                ("target_project_id", self.project_ref.clone()),
+                ("target_issue_iid", blocker_iid.to_string()),
+                ("link_type", String::from("is_blocked_by")),
+            ])
+            .send()
+            .context("failed to add blocker")?
+            .error_for_status()
+            .context("GitLab rejected blocker creation")?;
+        Ok(())
+    }
+
+    pub fn delete_issue_link(&self, issue_iid: u64, issue_link_id: u64) -> Result<()> {
+        self.http
+            .delete(self.url(&format!("/issues/{issue_iid}/links/{issue_link_id}")))
+            .send()
+            .context("failed to remove blocker")?
+            .error_for_status()
+            .context("GitLab rejected blocker removal")?;
+        Ok(())
     }
 
     fn get_paginated<T>(&self, path: &str, query: &[(&str, String)]) -> Result<Vec<T>>

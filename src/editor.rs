@@ -1,11 +1,5 @@
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum EditMode {
-    Normal,
-    Insert,
-}
-
 #[derive(Debug, Clone)]
 pub struct TextBuffer {
     lines: Vec<String>,
@@ -36,6 +30,10 @@ impl TextBuffer {
 
     pub fn to_text(&self) -> String {
         self.lines.join("\n")
+    }
+
+    pub fn lines(&self) -> &[String] {
+        &self.lines
     }
 
     pub fn row(&self) -> usize {
@@ -90,6 +88,12 @@ impl TextBuffer {
     pub fn insert_char(&mut self, ch: char) {
         self.lines[self.row].insert(self.col, ch);
         self.col += 1;
+    }
+
+    pub fn insert_str(&mut self, value: &str) {
+        for ch in value.chars() {
+            self.insert_char(ch);
+        }
     }
 
     pub fn insert_newline(&mut self) {
@@ -163,36 +167,6 @@ impl TextBuffer {
                 true
             }
             KeyCode::End => {
-                self.move_line_end();
-                true
-            }
-            _ => false,
-        }
-    }
-
-    pub fn handle_normal_motion(&mut self, key: KeyEvent, multiline: bool) -> bool {
-        match key.code {
-            KeyCode::Char('h') | KeyCode::Left => {
-                self.move_left();
-                true
-            }
-            KeyCode::Char('l') | KeyCode::Right => {
-                self.move_right();
-                true
-            }
-            KeyCode::Char('k') | KeyCode::Up if multiline => {
-                self.move_up();
-                true
-            }
-            KeyCode::Char('j') | KeyCode::Down if multiline => {
-                self.move_down();
-                true
-            }
-            KeyCode::Char('0') | KeyCode::Home => {
-                self.move_line_start();
-                true
-            }
-            KeyCode::Char('$') | KeyCode::End => {
                 self.move_line_end();
                 true
             }

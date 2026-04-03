@@ -1,20 +1,26 @@
 use std::collections::{BTreeSet, HashMap};
+use std::sync::mpsc::{self, Receiver, TryRecvError};
+use std::thread;
 
 use anyhow::{Result, anyhow};
 use chrono::{Datelike, Duration, Local, NaiveDate};
-use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
-use ratatui::layout::Rect;
+use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+use ratatui_themes::{Theme, ThemeName};
 
 use crate::config::AppConfig;
-use crate::editor::{EditMode, TextBuffer};
+use crate::editor::TextBuffer;
 use crate::gitlab::{GitLabClient, IssueDraft, IssueUpdate, StateEvent};
-use crate::model::{Issue, Note};
-use crate::theme::Theme;
+use crate::model::{Issue, IssueLink, Note};
+
+const SPINNER_FRAMES: &[&str] = &["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Mode {
     Normal,
     IssueView,
+    ConfirmDelete,
+    BlockerPicker,
+    ThemePicker,
     Search,
     Command,
     IssueEditor,
@@ -59,13 +65,12 @@ pub struct IssueEditorState {
     pub title: TextBuffer,
     pub body: TextBuffer,
     pub focus: EditorField,
-    pub mode: EditMode,
 }
 
 #[derive(Debug, Clone)]
 pub struct CommentEditorState {
+    pub target_iid: u64,
     pub body: TextBuffer,
-    pub mode: EditMode,
 }
 
 #[derive(Debug, Clone)]
@@ -91,7 +96,67 @@ pub struct DueDatePickerState {
     pub selected: NaiveDate,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
+pub struct DeleteConfirmationState {
+    pub iid: u64,
+    pub title: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct AlertState {
+    pub title: String,
+    pub message: String,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub enum MentionTarget {
+    IssueTitle,
+    IssueBody,
+    CommentBody,
+}
+
+#[derive(Debug, Clone)]
+pub struct MentionPickerState {
+    pub target: MentionTarget,
+    pub query: String,
+    pub cursor: usize,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BlockerAction {
+    Add,
+    Remove,
+}
+
+#[derive(Debug, Clone)]
+pub struct BlockerPickerState {
+    pub action: BlockerAction,
+    pub query: String,
+    pub cursor: usize,
+}
+
+#[derive(Debug, Clone)]
+pub struct BlockerCandidate {
+    pub iid: u64,
+    pub title: String,
+    pub state: String,
+    pub issue_link_id: Option<u64>,
+}
+
+struct RefreshPayload {
+    issues: Vec<Issue>,
+    labels: Vec<String>,
+    notes_cache: HashMap<u64, Vec<Note>>,
+    issue_links_cache: HashMap<u64, Vec<IssueLink>>,
+}
+
+struct LoadingState {
+    message: String,
+    spinner_frame: usize,
+    selected_iid: Option<u64>,
+    receiver: Receiver<Result<RefreshPayload, String>>,
+}
+
 pub struct App {
     pub config: AppConfig,
     pub theme: Theme,
@@ -99,10 +164,10 @@ pub struct App {
     pub issues: Vec<Issue>,
     pub labels: Vec<String>,
     pub notes_cache: HashMap<u64, Vec<Note>>,
+    pub issue_links_cache: HashMap<u64, Vec<IssueLink>>,
     pub filters: Filters,
     pub selected: usize,
     pub issue_view_scroll: u16,
-    pub issue_view_rect: Rect,
     pub issue_view_view_height: u16,
     pub issue_view_content_height: u16,
     pub mode: Mode,
@@ -117,18 +182,25 @@ pub struct App {
     pub selector: Option<SelectorState>,
     pub selector_kind: Option<SelectorKind>,
     pub due_date_picker: Option<DueDatePickerState>,
+    pub delete_confirmation: Option<DeleteConfirmationState>,
+    pub alert: Option<AlertState>,
+    pub mention_picker: Option<MentionPickerState>,
+    pub blocker_picker: Option<BlockerPickerState>,
+    return_mode: Mode,
     pending_g: bool,
+    loading: Option<LoadingState>,
 }
 
 impl App {
     pub fn new(config: AppConfig, client: GitLabClient) -> Result<Self> {
-        let mut app = Self {
-            theme: Theme::from_name(config.theme),
+        Ok(Self {
             config,
+            theme: Theme::new(ThemeName::RosePine),
             client,
             issues: Vec::new(),
             labels: Vec::new(),
             notes_cache: HashMap::new(),
+            issue_links_cache: HashMap::new(),
             filters: Filters {
                 state: StateFilter::Open,
                 label: None,
@@ -137,7 +209,6 @@ impl App {
             },
             selected: 0,
             issue_view_scroll: 0,
-            issue_view_rect: Rect::default(),
             issue_view_view_height: 0,
             issue_view_content_height: 0,
             mode: Mode::Normal,
@@ -152,17 +223,155 @@ impl App {
             selector: None,
             selector_kind: None,
             due_date_picker: None,
+            delete_confirmation: None,
+            alert: None,
+            mention_picker: None,
+            blocker_picker: None,
+            return_mode: Mode::Normal,
             pending_g: false,
+            loading: None,
+        })
+    }
+
+    pub fn begin_refresh(&mut self, message: &str) {
+        if self.loading.is_some() {
+            return;
+        }
+
+        let client = self.client.clone();
+        let selected_iid = self.selected_issue().map(|issue| issue.iid);
+        let (sender, receiver) = mpsc::channel();
+        let loading_message = message.to_string();
+
+        thread::spawn(move || {
+            let result = (|| -> Result<RefreshPayload> {
+                let mut issues = client.list_issues()?;
+                issues.sort_by(|left, right| right.updated_at.cmp(&left.updated_at));
+                let labels = client.list_labels()?;
+                let mut notes_cache = HashMap::new();
+                let mut issue_links_cache = HashMap::new();
+                for issue in &issues {
+                    let notes = client.list_notes(issue.iid)?;
+                    notes_cache.insert(issue.iid, notes);
+                    let links = client.list_issue_links(issue.iid)?;
+                    issue_links_cache.insert(issue.iid, links);
+                }
+                Ok(RefreshPayload {
+                    issues,
+                    labels,
+                    notes_cache,
+                    issue_links_cache,
+                })
+            })()
+            .map_err(|error| format!("{error:#}"));
+
+            let _ = sender.send(result);
+        });
+
+        self.loading = Some(LoadingState {
+            message: loading_message.clone(),
+            spinner_frame: 0,
+            selected_iid,
+            receiver,
+        });
+        self.status_line = loading_message;
+    }
+
+    pub fn tick(&mut self) {
+        let result = if let Some(loading) = self.loading.as_mut() {
+            loading.spinner_frame = (loading.spinner_frame + 1) % SPINNER_FRAMES.len();
+            match loading.receiver.try_recv() {
+                Ok(result) => Some(result),
+                Err(TryRecvError::Disconnected) => {
+                    Some(Err(String::from("refresh worker disconnected")))
+                }
+                Err(TryRecvError::Empty) => None,
+            }
+        } else {
+            None
         };
 
-        app.refresh()?;
-        Ok(app)
+        if let Some(result) = result {
+            let loading = self.loading.take();
+            match result {
+                Ok(payload) => {
+                    self.apply_refresh_payload(
+                        payload,
+                        loading.and_then(|state| state.selected_iid),
+                    );
+                }
+                Err(error) => self.show_error(format!("refresh failed: {error}")),
+            }
+        }
+    }
+
+    pub fn is_loading(&self) -> bool {
+        self.loading.is_some()
+    }
+
+    pub fn loading_message(&self) -> Option<&str> {
+        self.loading
+            .as_ref()
+            .map(|loading| loading.message.as_str())
+    }
+
+    pub fn spinner_frame(&self) -> &'static str {
+        self.loading
+            .as_ref()
+            .map(|loading| SPINNER_FRAMES[loading.spinner_frame % SPINNER_FRAMES.len()])
+            .unwrap_or(" ")
+    }
+
+    pub fn has_alert(&self) -> bool {
+        self.alert.is_some()
+    }
+
+    pub fn is_text_editing(&self) -> bool {
+        matches!(self.mode, Mode::IssueEditor | Mode::CommentEditor)
+    }
+
+    pub fn has_mention_picker(&self) -> bool {
+        self.mention_picker.is_some()
+    }
+
+    pub fn has_blocker_picker(&self) -> bool {
+        self.blocker_picker.is_some()
+    }
+
+    pub fn show_error(&mut self, message: impl Into<String>) {
+        let message = message.into();
+        self.status_line = first_line(&message);
+        self.alert = Some(AlertState {
+            title: error_title(&message),
+            message,
+        });
     }
 
     pub fn on_key(&mut self, key: KeyEvent) -> Result<()> {
+        if self.alert.is_some() {
+            match key.code {
+                KeyCode::Esc | KeyCode::Enter | KeyCode::Char('q') => self.alert = None,
+                _ => {}
+            }
+            return Ok(());
+        }
+
+        if key.modifiers.contains(KeyModifiers::CONTROL) && matches!(key.code, KeyCode::Char('r')) {
+            self.pending_g = false;
+            self.begin_refresh("Refreshing GitLab data");
+            return Ok(());
+        }
+
+        if self.is_loading() {
+            return Ok(());
+        }
+
         match self.mode {
             Mode::Normal => self.handle_normal_mode(key),
             Mode::IssueView => self.handle_issue_view_mode(key),
+            Mode::ConfirmDelete => self.handle_confirm_delete_mode(key),
+            Mode::BlockerPicker => self.handle_blocker_picker_mode(key),
+            Mode::ThemePicker => self.handle_theme_picker_mode(key),
             Mode::Search => self.handle_search_mode(key),
             Mode::Command => self.handle_command_mode(key),
             Mode::IssueEditor => self.handle_issue_editor_mode(key),
@@ -177,70 +386,10 @@ impl App {
         }
     }
 
-    pub fn on_mouse(&mut self, mouse: MouseEvent) -> Result<()> {
-        match self.mode {
-            Mode::Normal => match mouse.kind {
-                MouseEventKind::Down(MouseButton::Left) => {
-                    self.pending_g = false;
-                }
-                MouseEventKind::ScrollDown => {
-                    self.pending_g = false;
-                    self.move_selection(1)?;
-                }
-                MouseEventKind::ScrollUp => {
-                    self.pending_g = false;
-                    self.move_selection(-1)?;
-                }
-                _ => {}
-            },
-            Mode::IssueView => match mouse.kind {
-                MouseEventKind::ScrollDown
-                    if rect_contains(self.issue_view_rect, mouse.column, mouse.row) =>
-                {
-                    self.scroll_issue_view_by(3);
-                }
-                MouseEventKind::ScrollUp
-                    if rect_contains(self.issue_view_rect, mouse.column, mouse.row) =>
-                {
-                    self.scroll_issue_view_by(-3);
-                }
-                _ => {}
-            },
-            _ => {}
-        }
-
-        Ok(())
-    }
-
-    pub fn sync_issue_view_layout(
-        &mut self,
-        issue_view_rect: Rect,
-        issue_view_view_height: u16,
-        issue_view_content_height: u16,
-    ) {
-        self.issue_view_rect = issue_view_rect;
-        self.issue_view_view_height = issue_view_view_height;
-        self.issue_view_content_height = issue_view_content_height;
+    pub fn sync_issue_view_layout(&mut self, view_height: u16, content_height: u16) {
+        self.issue_view_view_height = view_height;
+        self.issue_view_content_height = content_height;
         self.issue_view_scroll = self.issue_view_scroll.min(self.max_issue_view_scroll());
-    }
-
-    pub fn refresh(&mut self) -> Result<()> {
-        let selected_iid = self.selected_issue().map(|issue| issue.iid);
-
-        self.issues = self.client.list_issues()?;
-        self.issues
-            .sort_by(|left, right| right.updated_at.cmp(&left.updated_at));
-
-        self.labels = self.client.list_labels()?;
-        self.rebuild_label_catalog();
-        self.restore_selection(selected_iid);
-        self.ensure_selected_notes_loaded()?;
-        self.status_line = format!(
-            "{} issues loaded from {}",
-            self.issues.len(),
-            self.config.project
-        );
-        Ok(())
     }
 
     pub fn selected_issue(&self) -> Option<&Issue> {
@@ -254,6 +403,22 @@ impl App {
         self.selected_issue()
             .and_then(|issue| self.notes_cache.get(&issue.iid))
             .map(Vec::as_slice)
+    }
+
+    pub fn selected_blockers(&self) -> Vec<&IssueLink> {
+        let Some(issue) = self.selected_issue() else {
+            return Vec::new();
+        };
+
+        self.issue_links_cache
+            .get(&issue.iid)
+            .map(|links| {
+                links
+                    .iter()
+                    .filter(|link| link.link_type == "is_blocked_by")
+                    .collect()
+            })
+            .unwrap_or_default()
     }
 
     pub fn visible_issue_indices(&self) -> Vec<usize> {
@@ -280,6 +445,9 @@ impl App {
         match self.mode {
             Mode::Normal => "BROWSE",
             Mode::IssueView => "ISSUE",
+            Mode::ConfirmDelete => "DELETE",
+            Mode::BlockerPicker => "BLOCKERS",
+            Mode::ThemePicker => "THEMES",
             Mode::Search => "SEARCH",
             Mode::Command => "COMMAND",
             Mode::IssueEditor => "EDITOR",
@@ -359,7 +527,6 @@ impl App {
         match key.code {
             KeyCode::Char('q') => self.should_quit = true,
             KeyCode::Char('?') => self.mode = Mode::Help,
-            KeyCode::Char('r') => self.refresh()?,
             KeyCode::Char('/') => {
                 self.pending_g = false;
                 self.search_backup = self.filters.search.clone();
@@ -383,11 +550,28 @@ impl App {
                 self.pending_g = false;
                 self.toggle_selected_issue_state()?;
             }
+            KeyCode::Char('D') => {
+                self.pending_g = false;
+                self.open_delete_confirmation();
+            }
+            KeyCode::Char('t') => {
+                self.pending_g = false;
+                self.capture_return_mode();
+                self.mode = Mode::ThemePicker;
+            }
             KeyCode::Char('c') => {
                 self.pending_g = false;
                 self.open_comment_editor();
             }
-            KeyCode::Char('L') => {
+            KeyCode::Char('b') => {
+                self.pending_g = false;
+                self.open_blocker_picker(BlockerAction::Add);
+            }
+            KeyCode::Char('B') => {
+                self.pending_g = false;
+                self.open_blocker_picker(BlockerAction::Remove);
+            }
+            KeyCode::Char('a') => {
                 self.pending_g = false;
                 self.open_label_editor();
             }
@@ -407,7 +591,7 @@ impl App {
                 self.pending_g = false;
                 self.cycle_state_filter()?;
             }
-            KeyCode::Char('l') => {
+            KeyCode::Char('F') | KeyCode::Char('l') => {
                 self.pending_g = false;
                 self.open_label_filter();
             }
@@ -443,16 +627,18 @@ impl App {
                 self.selected = 0;
                 self.pending_g = false;
                 self.ensure_selected_notes_loaded()?;
+                self.ensure_selected_issue_links_loaded()?;
             }
             KeyCode::Char('g') => self.pending_g = true,
             KeyCode::Char('G') => {
                 self.selected = self.visible_count().saturating_sub(1);
                 self.pending_g = false;
                 self.ensure_selected_notes_loaded()?;
+                self.ensure_selected_issue_links_loaded()?;
             }
             KeyCode::Enter => {
                 self.pending_g = false;
-                self.open_issue_view();
+                self.open_issue_view()?;
             }
             _ => self.pending_g = false,
         }
@@ -481,6 +667,59 @@ impl App {
             KeyCode::Esc => {
                 self.pending_g = false;
                 self.mode = Mode::Normal;
+            }
+            KeyCode::Char('e') => {
+                self.pending_g = false;
+                self.open_issue_editor(self.selected_issue().cloned());
+            }
+            KeyCode::Char('c') => {
+                self.pending_g = false;
+                self.open_comment_editor();
+            }
+            KeyCode::Char('b') => {
+                self.pending_g = false;
+                self.open_blocker_picker(BlockerAction::Add);
+            }
+            KeyCode::Char('B') => {
+                self.pending_g = false;
+                self.open_blocker_picker(BlockerAction::Remove);
+            }
+            KeyCode::Char('a') => {
+                self.pending_g = false;
+                self.open_label_editor();
+            }
+            KeyCode::Char('S') => {
+                self.pending_g = false;
+                self.open_status_editor();
+            }
+            KeyCode::Char('d') => {
+                self.pending_g = false;
+                self.open_due_date_picker();
+            }
+            KeyCode::Char('x') => {
+                self.pending_g = false;
+                self.toggle_selected_issue_state()?;
+            }
+            KeyCode::Char('D') => {
+                self.pending_g = false;
+                self.open_delete_confirmation();
+            }
+            KeyCode::Char('t') => {
+                self.pending_g = false;
+                self.capture_return_mode();
+                self.mode = Mode::ThemePicker;
+            }
+            KeyCode::Char('H') => {
+                self.pending_g = false;
+                self.move_selected_issue_status(-1)?;
+            }
+            KeyCode::Char('L') => {
+                self.pending_g = false;
+                self.move_selected_issue_status(1)?;
+            }
+            KeyCode::Char('?') => {
+                self.pending_g = false;
+                self.mode = Mode::Help;
             }
             KeyCode::Down | KeyCode::Char('j') => {
                 self.pending_g = false;
@@ -513,6 +752,83 @@ impl App {
         Ok(())
     }
 
+    fn handle_confirm_delete_mode(&mut self, key: KeyEvent) -> Result<()> {
+        match key.code {
+            KeyCode::Esc | KeyCode::Char('n') => {
+                self.delete_confirmation = None;
+                self.restore_return_mode();
+            }
+            KeyCode::Char('y') | KeyCode::Enter => self.confirm_delete_issue()?,
+            _ => {}
+        }
+
+        Ok(())
+    }
+
+    fn handle_blocker_picker_mode(&mut self, key: KeyEvent) -> Result<()> {
+        if self.blocker_picker.is_none() {
+            self.restore_return_mode();
+            return Ok(());
+        }
+
+        match key.code {
+            KeyCode::Esc => {
+                self.blocker_picker = None;
+                self.restore_return_mode();
+            }
+            KeyCode::Enter => self.apply_blocker_picker()?,
+            KeyCode::Backspace => {
+                if let Some(picker) = self.blocker_picker.as_mut() {
+                    picker.query.pop();
+                    picker.cursor = 0;
+                }
+            }
+            KeyCode::Char('j') | KeyCode::Down => {
+                let count = self.blocker_candidates().len().max(1);
+                if let Some(picker) = self.blocker_picker.as_mut() {
+                    picker.cursor = (picker.cursor + 1).min(count - 1);
+                }
+            }
+            KeyCode::Char('k') | KeyCode::Up => {
+                if let Some(picker) = self.blocker_picker.as_mut() {
+                    picker.cursor = picker.cursor.saturating_sub(1);
+                }
+            }
+            KeyCode::Char(ch)
+                if !key
+                    .modifiers
+                    .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
+            {
+                if let Some(picker) = self.blocker_picker.as_mut() {
+                    picker.query.push(ch);
+                    picker.cursor = 0;
+                }
+            }
+            _ => {}
+        }
+
+        Ok(())
+    }
+
+    fn handle_theme_picker_mode(&mut self, key: KeyEvent) -> Result<()> {
+        match key.code {
+            KeyCode::Esc | KeyCode::Enter => {
+                self.restore_return_mode();
+            }
+            KeyCode::Left | KeyCode::Char('h') => {
+                self.theme.prev();
+                self.status_line = format!("theme: {}", self.theme.name.display_name());
+            }
+            KeyCode::Right | KeyCode::Char('l') => {
+                self.theme.next();
+                self.status_line = format!("theme: {}", self.theme.name.display_name());
+            }
+            _ => {}
+        }
+
+        Ok(())
+    }
+
     fn handle_search_mode(&mut self, key: KeyEvent) -> Result<()> {
         match key.code {
             KeyCode::Esc => {
@@ -522,6 +838,7 @@ impl App {
                 self.selected = 0;
                 self.clamp_selection();
                 self.ensure_selected_notes_loaded()?;
+                self.ensure_selected_issue_links_loaded()?;
             }
             KeyCode::Enter => {
                 self.mode = Mode::Normal;
@@ -529,6 +846,7 @@ impl App {
                 self.issue_view_scroll = 0;
                 self.clamp_selection();
                 self.ensure_selected_notes_loaded()?;
+                self.ensure_selected_issue_links_loaded()?;
             }
             KeyCode::Backspace => {
                 self.search_input.pop();
@@ -581,8 +899,12 @@ impl App {
     }
 
     fn handle_issue_editor_mode(&mut self, key: KeyEvent) -> Result<()> {
+        if self.mention_picker.is_some() {
+            return self.handle_mention_picker(key);
+        }
+
         let Some(editor) = self.issue_editor.as_mut() else {
-            self.mode = Mode::Normal;
+            self.mode = self.return_mode;
             return Ok(());
         };
 
@@ -590,41 +912,46 @@ impl App {
             return self.save_issue_editor();
         }
 
-        match editor.mode {
-            EditMode::Normal => match key.code {
-                KeyCode::Esc | KeyCode::Char('q') => {
-                    self.issue_editor = None;
-                    self.mode = Mode::Normal;
-                }
-                KeyCode::Char('i') => editor.mode = EditMode::Insert,
-                KeyCode::Tab => editor.focus = next_field(editor.focus),
-                KeyCode::BackTab => editor.focus = previous_field(editor.focus),
-                _ => {
-                    let multiline = matches!(editor.focus, EditorField::Body);
-                    let buffer = active_issue_buffer(editor);
-                    buffer.handle_normal_motion(key, multiline);
-                }
-            },
-            EditMode::Insert => match key.code {
-                KeyCode::Esc => editor.mode = EditMode::Normal,
-                KeyCode::Tab => editor.focus = next_field(editor.focus),
-                KeyCode::Enter if matches!(editor.focus, EditorField::Title) => {
-                    editor.focus = EditorField::Body;
-                }
-                _ => {
-                    let multiline = matches!(editor.focus, EditorField::Body);
-                    let buffer = active_issue_buffer(editor);
-                    buffer.handle_insert_key(key, multiline);
-                }
-            },
+        match key.code {
+            KeyCode::Esc => {
+                self.restore_return_mode();
+                self.status_line = String::from("issue draft kept locally");
+            }
+            KeyCode::Tab => editor.focus = next_field(editor.focus),
+            KeyCode::BackTab => editor.focus = previous_field(editor.focus),
+            KeyCode::Enter if matches!(editor.focus, EditorField::Title) => {
+                editor.focus = EditorField::Body;
+            }
+            KeyCode::Char('#')
+                if !key
+                    .modifiers
+                    .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
+            {
+                let target = match editor.focus {
+                    EditorField::Title => MentionTarget::IssueTitle,
+                    EditorField::Body => MentionTarget::IssueBody,
+                };
+                let buffer = active_issue_buffer(editor);
+                buffer.insert_char('#');
+                self.open_mention_picker(target);
+            }
+            _ => {
+                let multiline = matches!(editor.focus, EditorField::Body);
+                let buffer = active_issue_buffer(editor);
+                buffer.handle_insert_key(key, multiline);
+            }
         }
 
         Ok(())
     }
 
     fn handle_comment_editor_mode(&mut self, key: KeyEvent) -> Result<()> {
+        if self.mention_picker.is_some() {
+            return self.handle_mention_picker(key);
+        }
+
         let Some(editor) = self.comment_editor.as_mut() else {
-            self.mode = Mode::Normal;
+            self.mode = self.return_mode;
             return Ok(());
         };
 
@@ -632,23 +959,22 @@ impl App {
             return self.save_comment_editor();
         }
 
-        match editor.mode {
-            EditMode::Normal => match key.code {
-                KeyCode::Esc | KeyCode::Char('q') => {
-                    self.comment_editor = None;
-                    self.mode = Mode::Normal;
-                }
-                KeyCode::Char('i') => editor.mode = EditMode::Insert,
-                _ => {
-                    editor.body.handle_normal_motion(key, true);
-                }
-            },
-            EditMode::Insert => match key.code {
-                KeyCode::Esc => editor.mode = EditMode::Normal,
-                _ => {
-                    editor.body.handle_insert_key(key, true);
-                }
-            },
+        match key.code {
+            KeyCode::Esc => {
+                self.restore_return_mode();
+                self.status_line = String::from("comment draft kept locally");
+            }
+            KeyCode::Char('#')
+                if !key
+                    .modifiers
+                    .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
+            {
+                editor.body.insert_char('#');
+                self.open_mention_picker(MentionTarget::CommentBody);
+            }
+            _ => {
+                editor.body.handle_insert_key(key, true);
+            }
         }
 
         Ok(())
@@ -656,14 +982,14 @@ impl App {
 
     fn handle_label_editor_mode(&mut self, key: KeyEvent) -> Result<()> {
         let Some(picker) = self.label_picker.as_mut() else {
-            self.mode = Mode::Normal;
+            self.mode = self.return_mode;
             return Ok(());
         };
 
         match key.code {
             KeyCode::Esc => {
                 self.label_picker = None;
-                self.mode = Mode::Normal;
+                self.restore_return_mode();
             }
             KeyCode::Enter => return self.save_label_picker(),
             KeyCode::Backspace => {
@@ -708,7 +1034,7 @@ impl App {
 
     fn handle_selector_mode(&mut self, key: KeyEvent) -> Result<()> {
         let Some(selector) = self.selector.as_mut() else {
-            self.mode = Mode::Normal;
+            self.mode = self.return_mode;
             return Ok(());
         };
 
@@ -716,7 +1042,7 @@ impl App {
             KeyCode::Esc => {
                 self.selector = None;
                 self.selector_kind = None;
-                self.mode = Mode::Normal;
+                self.restore_return_mode();
             }
             KeyCode::Enter => return self.apply_selector(),
             KeyCode::Backspace => {
@@ -754,14 +1080,14 @@ impl App {
 
     fn handle_due_date_mode(&mut self, key: KeyEvent) -> Result<()> {
         let Some(picker) = self.due_date_picker.as_mut() else {
-            self.mode = Mode::Normal;
+            self.mode = self.return_mode;
             return Ok(());
         };
 
         match key.code {
             KeyCode::Esc => {
                 self.due_date_picker = None;
-                self.mode = Mode::Normal;
+                self.restore_return_mode();
             }
             KeyCode::Enter => {
                 let selected = picker.selected;
@@ -790,7 +1116,7 @@ impl App {
         match command {
             "" => {}
             "q" | "quit" => self.should_quit = true,
-            "refresh" | "r" => self.refresh()?,
+            "refresh" | "r" => self.begin_refresh("Refreshing GitLab data"),
             "new" => self.open_issue_editor(None),
             "close" => self.close_selected_issue()?,
             "reopen" => self.reopen_selected_issue()?,
@@ -806,16 +1132,69 @@ impl App {
                 self.selected = 0;
                 self.clamp_selection();
                 self.ensure_selected_notes_loaded()?;
+                self.ensure_selected_issue_links_loaded()?;
             }
             "filter status clear" => {
                 self.filters.status = None;
                 self.selected = 0;
                 self.clamp_selection();
                 self.ensure_selected_notes_loaded()?;
+                self.ensure_selected_issue_links_loaded()?;
             }
-            _ => {
-                self.status_line = format!("unknown command: {command}");
+            _ => self.status_line = format!("unknown command: {command}"),
+        }
+
+        Ok(())
+    }
+
+    fn handle_mention_picker(&mut self, key: KeyEvent) -> Result<()> {
+        match key.code {
+            KeyCode::Esc => {
+                self.mention_picker = None;
             }
+            KeyCode::Enter => {
+                if let Some(issue_iid) = self.current_mention_issue_iid() {
+                    self.insert_issue_mention(issue_iid);
+                } else {
+                    self.mention_picker = None;
+                }
+            }
+            KeyCode::Char('j') | KeyCode::Down => {
+                let count = self.mention_candidates().len().max(1);
+                if let Some(picker) = self.mention_picker.as_mut() {
+                    picker.cursor = (picker.cursor + 1).min(count - 1);
+                }
+            }
+            KeyCode::Char('k') | KeyCode::Up => {
+                if let Some(picker) = self.mention_picker.as_mut() {
+                    picker.cursor = picker.cursor.saturating_sub(1);
+                }
+            }
+            KeyCode::Backspace => {
+                if let Some(picker) = self.mention_picker.as_mut() {
+                    if !picker.query.is_empty() {
+                        picker.query.pop();
+                        picker.cursor = 0;
+                    } else {
+                        let target = picker.target;
+                        self.mention_picker = None;
+                        if let Some(buffer) = self.mention_target_buffer_mut(target) {
+                            buffer.backspace();
+                        }
+                    }
+                }
+            }
+            KeyCode::Char(ch)
+                if !key
+                    .modifiers
+                    .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
+            {
+                if let Some(picker) = self.mention_picker.as_mut() {
+                    picker.query.push(ch);
+                    picker.cursor = 0;
+                }
+            }
+            _ => {}
         }
 
         Ok(())
@@ -832,13 +1211,197 @@ impl App {
         if next != self.selected {
             self.selected = next;
             self.ensure_selected_notes_loaded()?;
+            self.ensure_selected_issue_links_loaded()?;
         }
         Ok(())
     }
 
-    fn open_issue_view(&mut self) {
+    pub fn mention_candidates(&self) -> Vec<usize> {
+        let query = self
+            .mention_picker
+            .as_ref()
+            .map(|picker| picker.query.trim().to_lowercase())
+            .unwrap_or_default();
+
+        self.issues
+            .iter()
+            .enumerate()
+            .filter(|(_, issue)| mention_matches(issue, &query))
+            .map(|(index, _)| index)
+            .take(12)
+            .collect()
+    }
+
+    pub fn current_mention_issue_iid(&self) -> Option<u64> {
+        let candidates = self.mention_candidates();
+        let cursor = self.mention_picker.as_ref()?.cursor;
+        candidates
+            .get(cursor.min(candidates.len().saturating_sub(1)))
+            .and_then(|index| self.issues.get(*index))
+            .map(|issue| issue.iid)
+    }
+
+    pub fn blocker_candidates(&self) -> Vec<BlockerCandidate> {
+        let Some(picker) = self.blocker_picker.as_ref() else {
+            return Vec::new();
+        };
+
+        let query = picker.query.trim().to_lowercase();
+        match picker.action {
+            BlockerAction::Add => {
+                let selected_iid = self.selected_issue().map(|issue| issue.iid);
+                let blocked_iids = self
+                    .selected_blockers()
+                    .into_iter()
+                    .map(|link| link.iid)
+                    .collect::<Vec<_>>();
+
+                self.issues
+                    .iter()
+                    .filter(|issue| Some(issue.iid) != selected_iid)
+                    .filter(|issue| !blocked_iids.contains(&issue.iid))
+                    .filter(|issue| mention_matches(issue, &query))
+                    .map(|issue| BlockerCandidate {
+                        iid: issue.iid,
+                        title: issue.title.clone(),
+                        state: issue.state.clone(),
+                        issue_link_id: None,
+                    })
+                    .take(20)
+                    .collect()
+            }
+            BlockerAction::Remove => self
+                .selected_blockers()
+                .into_iter()
+                .filter(|link| blocker_matches(link, &query))
+                .map(|link| BlockerCandidate {
+                    iid: link.iid,
+                    title: link.title.clone(),
+                    state: link.state.clone(),
+                    issue_link_id: Some(link.issue_link_id),
+                })
+                .take(20)
+                .collect(),
+        }
+    }
+
+    fn current_blocker_candidate(&self) -> Option<BlockerCandidate> {
+        let candidates = self.blocker_candidates();
+        let cursor = self.blocker_picker.as_ref()?.cursor;
+        candidates
+            .get(cursor.min(candidates.len().saturating_sub(1)))
+            .cloned()
+    }
+
+    fn open_issue_view(&mut self) -> Result<()> {
         self.issue_view_scroll = 0;
+        self.ensure_selected_notes_loaded()?;
+        self.ensure_selected_issue_links_loaded()?;
         self.mode = Mode::IssueView;
+        Ok(())
+    }
+
+    fn open_blocker_picker(&mut self, action: BlockerAction) {
+        if self.selected_issue().is_none() {
+            return;
+        }
+        if action == BlockerAction::Remove && self.selected_blockers().is_empty() {
+            self.status_line = String::from("no blockers to remove");
+            return;
+        }
+
+        self.capture_return_mode();
+        self.blocker_picker = Some(BlockerPickerState {
+            action,
+            query: String::new(),
+            cursor: 0,
+        });
+        self.mode = Mode::BlockerPicker;
+    }
+
+    fn apply_blocker_picker(&mut self) -> Result<()> {
+        let Some(candidate) = self.current_blocker_candidate() else {
+            self.blocker_picker = None;
+            self.restore_return_mode();
+            return Ok(());
+        };
+        let Some(issue_iid) = self.selected_issue().map(|issue| issue.iid) else {
+            self.blocker_picker = None;
+            self.restore_return_mode();
+            return Ok(());
+        };
+
+        let action = self
+            .blocker_picker
+            .as_ref()
+            .map(|picker| picker.action)
+            .unwrap_or(BlockerAction::Add);
+
+        match action {
+            BlockerAction::Add => {
+                self.client.add_blocker(issue_iid, candidate.iid)?;
+                self.refresh_issue_links(issue_iid)?;
+                self.status_line = format!("added blocker #{}", candidate.iid);
+            }
+            BlockerAction::Remove => {
+                let link_id = candidate
+                    .issue_link_id
+                    .ok_or_else(|| anyhow!("missing blocker link id"))?;
+                self.client.delete_issue_link(issue_iid, link_id)?;
+                self.refresh_issue_links(issue_iid)?;
+                self.status_line = format!("removed blocker #{}", candidate.iid);
+            }
+        }
+
+        self.blocker_picker = None;
+        self.restore_return_mode();
+        Ok(())
+    }
+
+    fn open_mention_picker(&mut self, target: MentionTarget) {
+        self.mention_picker = Some(MentionPickerState {
+            target,
+            query: String::new(),
+            cursor: 0,
+        });
+    }
+
+    fn insert_issue_mention(&mut self, iid: u64) {
+        let Some(target) = self.mention_picker.take().map(|picker| picker.target) else {
+            return;
+        };
+
+        if let Some(buffer) = self.mention_target_buffer_mut(target) {
+            buffer.insert_str(&iid.to_string());
+        }
+    }
+
+    fn open_delete_confirmation(&mut self) {
+        let Some((iid, title)) = self
+            .selected_issue()
+            .map(|issue| (issue.iid, issue.title.clone()))
+        else {
+            return;
+        };
+
+        self.capture_return_mode();
+        self.delete_confirmation = Some(DeleteConfirmationState { iid, title });
+        self.mode = Mode::ConfirmDelete;
+    }
+
+    fn confirm_delete_issue(&mut self) -> Result<()> {
+        let Some(confirm) = self.delete_confirmation.clone() else {
+            self.restore_return_mode();
+            return Ok(());
+        };
+
+        self.client.delete_issue(confirm.iid)?;
+        self.delete_confirmation = None;
+        self.remove_issue(confirm.iid);
+        self.mode = Mode::Normal;
+        self.return_mode = Mode::Normal;
+        self.status_line = format!("deleted #{}", confirm.iid);
+        Ok(())
     }
 
     fn cycle_state_filter(&mut self) -> Result<()> {
@@ -863,6 +1426,57 @@ impl App {
     pub fn max_issue_view_scroll(&self) -> u16 {
         self.issue_view_content_height
             .saturating_sub(self.issue_view_view_height)
+    }
+
+    fn move_selected_issue_status(&mut self, direction: isize) -> Result<()> {
+        let statuses = self.available_statuses();
+        let issue = self
+            .selected_issue()
+            .cloned()
+            .ok_or_else(|| anyhow!("no issue selected"))?;
+        let current = self
+            .issue_status(&issue)
+            .unwrap_or_else(|| self.default_status());
+        let current_index = statuses
+            .iter()
+            .position(|status| status == &current)
+            .unwrap_or(0);
+        let next_index = (current_index as isize + direction)
+            .clamp(0, (statuses.len().saturating_sub(1)) as isize)
+            as usize;
+
+        if next_index == current_index {
+            return Ok(());
+        }
+
+        let next_status = statuses[next_index].clone();
+        let mut labels = issue
+            .labels
+            .iter()
+            .filter(|label| !label.starts_with("status::"))
+            .cloned()
+            .collect::<Vec<_>>();
+        labels.push(next_status.clone());
+
+        let updated = self.client.update_issue(
+            issue.iid,
+            &IssueUpdate {
+                labels: Some(labels),
+                ..IssueUpdate::default()
+            },
+        )?;
+
+        self.replace_issue(updated);
+        self.status_line = format!("moved #{} to {next_status}", issue.iid);
+        Ok(())
+    }
+
+    fn default_status(&self) -> String {
+        self.config
+            .status_labels
+            .first()
+            .cloned()
+            .unwrap_or_else(|| String::from("status::todo"))
     }
 
     fn toggle_selected_issue_state(&mut self) -> Result<()> {
@@ -921,31 +1535,60 @@ impl App {
         Ok(())
     }
 
+    fn ensure_selected_issue_links_loaded(&mut self) -> Result<()> {
+        let Some(iid) = self.selected_issue().map(|issue| issue.iid) else {
+            return Ok(());
+        };
+        if !self.issue_links_cache.contains_key(&iid) {
+            let links = self.client.list_issue_links(iid)?;
+            self.issue_links_cache.insert(iid, links);
+        }
+        Ok(())
+    }
+
+    fn refresh_issue_links(&mut self, issue_iid: u64) -> Result<()> {
+        let links = self.client.list_issue_links(issue_iid)?;
+        self.issue_links_cache.insert(issue_iid, links);
+        Ok(())
+    }
+
     fn set_state_filter(&mut self, state: StateFilter) -> Result<()> {
         self.filters.state = state;
         self.selected = 0;
         self.issue_view_scroll = 0;
         self.clamp_selection();
         self.ensure_selected_notes_loaded()?;
+        self.ensure_selected_issue_links_loaded()?;
         self.status_line = format!("state filter: {}", self.state_label());
         Ok(())
     }
 
     fn open_issue_editor(&mut self, issue: Option<Issue>) {
+        self.capture_return_mode();
+        let target_iid = issue.as_ref().map(|item| item.iid);
+        if self
+            .issue_editor
+            .as_ref()
+            .map(|draft| draft.editing_iid == target_iid)
+            .unwrap_or(false)
+        {
+            self.mode = Mode::IssueEditor;
+            return;
+        }
+
+        self.mention_picker = None;
         self.issue_editor = Some(match issue {
             Some(issue) => IssueEditorState {
                 editing_iid: Some(issue.iid),
                 title: TextBuffer::from_text(&issue.title),
                 body: TextBuffer::from_text(&issue.description),
                 focus: EditorField::Title,
-                mode: EditMode::Normal,
             },
             None => IssueEditorState {
                 editing_iid: None,
                 title: TextBuffer::new(),
                 body: TextBuffer::new(),
                 focus: EditorField::Title,
-                mode: EditMode::Insert,
             },
         });
         self.mode = Mode::IssueEditor;
@@ -955,6 +1598,7 @@ impl App {
         let Some(editor) = self.issue_editor.take() else {
             return Ok(());
         };
+        self.mention_picker = None;
 
         let title = editor.title.to_text().trim().to_string();
         if title.is_empty() {
@@ -976,22 +1620,38 @@ impl App {
             None => self.client.create_issue(&IssueDraft {
                 title,
                 description,
-                labels: Vec::new(),
+                labels: vec![self.default_status()],
                 due_date: None,
             })?,
         };
 
         let iid = issue.iid;
         self.replace_issue(issue);
-        self.mode = Mode::Normal;
+        self.restore_return_mode();
         self.status_line = format!("saved #{iid}");
         Ok(())
     }
 
     fn open_comment_editor(&mut self) {
+        let Some(target_iid) = self.selected_issue().map(|issue| issue.iid) else {
+            return;
+        };
+
+        self.capture_return_mode();
+        if self
+            .comment_editor
+            .as_ref()
+            .map(|draft| draft.target_iid == target_iid)
+            .unwrap_or(false)
+        {
+            self.mode = Mode::CommentEditor;
+            return;
+        }
+
+        self.mention_picker = None;
         self.comment_editor = Some(CommentEditorState {
+            target_iid,
             body: TextBuffer::new(),
-            mode: EditMode::Insert,
         });
         self.mode = Mode::CommentEditor;
     }
@@ -1000,10 +1660,8 @@ impl App {
         let Some(editor) = self.comment_editor.take() else {
             return Ok(());
         };
-        let iid = self
-            .selected_issue()
-            .map(|issue| issue.iid)
-            .ok_or_else(|| anyhow!("no issue selected"))?;
+        self.mention_picker = None;
+        let iid = editor.target_iid;
 
         let body = editor.body.to_text().trim().to_string();
         if body.is_empty() {
@@ -1014,19 +1672,23 @@ impl App {
 
         let note = self.client.add_note(iid, &body)?;
         self.notes_cache.entry(iid).or_default().push(note);
-        self.mode = Mode::Normal;
+        self.restore_return_mode();
         self.status_line = format!("comment added to #{iid}");
         Ok(())
     }
 
     fn open_label_editor(&mut self) {
-        let Some(issue) = self.selected_issue() else {
+        let Some(selected) = self
+            .selected_issue()
+            .map(|issue| issue.labels.iter().cloned().collect::<BTreeSet<_>>())
+        else {
             return;
         };
 
+        self.capture_return_mode();
         self.label_picker = Some(LabelPickerState {
             query: String::new(),
-            selected: issue.labels.iter().cloned().collect(),
+            selected,
             cursor: 0,
         });
         self.mode = Mode::LabelEditor;
@@ -1051,12 +1713,13 @@ impl App {
         )?;
 
         self.replace_issue(issue);
-        self.mode = Mode::Normal;
+        self.restore_return_mode();
         self.status_line = format!("labels updated for #{iid}");
         Ok(())
     }
 
     fn open_label_filter(&mut self) {
+        self.capture_return_mode();
         self.selector = Some(SelectorState {
             title: String::from("Filter by Label"),
             query: String::new(),
@@ -1070,6 +1733,7 @@ impl App {
     }
 
     fn open_status_filter(&mut self) {
+        self.capture_return_mode();
         self.selector = Some(SelectorState {
             title: String::from("Filter by Status"),
             query: String::new(),
@@ -1083,14 +1747,18 @@ impl App {
     }
 
     fn open_status_editor(&mut self) {
-        let Some(issue) = self.selected_issue() else {
+        let Some(selected_status) = self.selected_issue().map(|issue| {
+            self.issue_status(issue)
+                .unwrap_or_else(|| self.default_status())
+        }) else {
             return;
         };
+        self.capture_return_mode();
         self.selector = Some(SelectorState {
             title: String::from("Set Issue Status"),
             query: String::new(),
             options: self.available_statuses(),
-            selected: self.issue_status(issue),
+            selected: Some(selected_status),
             cursor: 0,
             allow_clear: true,
         });
@@ -1102,11 +1770,11 @@ impl App {
         let kind = self.selector_kind.take();
         let selector = self.selector.take();
         let Some(kind) = kind else {
-            self.mode = Mode::Normal;
+            self.restore_return_mode();
             return Ok(());
         };
         let Some(selector) = selector else {
-            self.mode = Mode::Normal;
+            self.restore_return_mode();
             return Ok(());
         };
 
@@ -1119,6 +1787,7 @@ impl App {
                 self.issue_view_scroll = 0;
                 self.clamp_selection();
                 self.ensure_selected_notes_loaded()?;
+                self.ensure_selected_issue_links_loaded()?;
                 self.status_line = match &self.filters.label {
                     Some(label) => format!("label filter: {label}"),
                     None => String::from("label filter cleared"),
@@ -1130,6 +1799,7 @@ impl App {
                 self.issue_view_scroll = 0;
                 self.clamp_selection();
                 self.ensure_selected_notes_loaded()?;
+                self.ensure_selected_issue_links_loaded()?;
                 self.status_line = match &self.filters.status {
                     Some(status) => format!("status filter: {status}"),
                     None => String::from("status filter cleared"),
@@ -1161,7 +1831,7 @@ impl App {
             }
         }
 
-        self.mode = Mode::Normal;
+        self.restore_return_mode();
         Ok(())
     }
 
@@ -1172,6 +1842,7 @@ impl App {
             .and_then(parse_due_date)
             .unwrap_or_else(|| Local::now().date_naive());
 
+        self.capture_return_mode();
         self.due_date_picker = Some(DueDatePickerState {
             month: first_of_month(selected),
             selected,
@@ -1195,7 +1866,7 @@ impl App {
 
         self.replace_issue(issue);
         self.due_date_picker = None;
-        self.mode = Mode::Normal;
+        self.restore_return_mode();
         self.status_line = match value {
             Some(date) => format!("due date set to {}", date.format("%Y-%m-%d")),
             None => format!("due date cleared for #{iid}"),
@@ -1291,15 +1962,52 @@ impl App {
         self.issues
             .sort_by(|left, right| right.updated_at.cmp(&left.updated_at));
         self.rebuild_label_catalog();
+        self.restore_selection(Some(iid));
+    }
 
-        let visible = self.visible_issue_indices();
-        if let Some(position) = visible
-            .iter()
-            .position(|index| self.issues[*index].iid == iid)
-        {
-            self.selected = position;
+    fn remove_issue(&mut self, iid: u64) {
+        self.issues.retain(|issue| issue.iid != iid);
+        self.notes_cache.remove(&iid);
+        self.issue_links_cache.remove(&iid);
+        self.clamp_selection();
+    }
+
+    fn apply_refresh_payload(&mut self, payload: RefreshPayload, selected_iid: Option<u64>) {
+        self.issues = payload.issues;
+        self.labels = payload.labels;
+        self.notes_cache = payload.notes_cache;
+        self.issue_links_cache = payload.issue_links_cache;
+        self.rebuild_label_catalog();
+        self.restore_selection(selected_iid);
+        self.status_line = format!(
+            "{} issues loaded from {}",
+            self.issues.len(),
+            self.config.project
+        );
+    }
+
+    fn capture_return_mode(&mut self) {
+        self.return_mode = if matches!(self.mode, Mode::IssueView) {
+            Mode::IssueView
         } else {
-            self.clamp_selection();
+            Mode::Normal
+        };
+    }
+
+    fn restore_return_mode(&mut self) {
+        self.mode = self.return_mode;
+        self.return_mode = Mode::Normal;
+        self.mention_picker = None;
+        self.blocker_picker = None;
+    }
+
+    fn mention_target_buffer_mut(&mut self, target: MentionTarget) -> Option<&mut TextBuffer> {
+        match target {
+            MentionTarget::IssueTitle => self.issue_editor.as_mut().map(|editor| &mut editor.title),
+            MentionTarget::IssueBody => self.issue_editor.as_mut().map(|editor| &mut editor.body),
+            MentionTarget::CommentBody => {
+                self.comment_editor.as_mut().map(|editor| &mut editor.body)
+            }
         }
     }
 }
@@ -1444,9 +2152,33 @@ fn last_day_of_month(year: i32, month: u32) -> u32 {
     (next - Duration::days(1)).day()
 }
 
-fn rect_contains(rect: Rect, column: u16, row: u16) -> bool {
-    column >= rect.x
-        && column < rect.x.saturating_add(rect.width)
-        && row >= rect.y
-        && row < rect.y.saturating_add(rect.height)
+fn first_line(message: &str) -> String {
+    message.lines().next().unwrap_or(message).to_string()
+}
+
+fn error_title(message: &str) -> String {
+    if message.contains("GitLab rejected")
+        || message.contains("HTTP status")
+        || message.contains("failed to fetch")
+    {
+        String::from("HTTP Error")
+    } else {
+        String::from("Error")
+    }
+}
+
+fn mention_matches(issue: &Issue, query: &str) -> bool {
+    if query.is_empty() {
+        return true;
+    }
+
+    issue.iid.to_string().contains(query) || issue.title.to_lowercase().contains(query)
+}
+
+fn blocker_matches(link: &IssueLink, query: &str) -> bool {
+    if query.is_empty() {
+        return true;
+    }
+
+    link.iid.to_string().contains(query) || link.title.to_lowercase().contains(query)
 }

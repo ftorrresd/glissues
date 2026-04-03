@@ -4,9 +4,8 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, anyhow};
 use clap::Parser;
+use reqwest::Url;
 use serde::Deserialize;
-
-use crate::theme::ThemeName;
 
 pub const DEFAULT_STATUS_LABELS: &[&str] = &[
     "status::todo",
@@ -20,14 +19,10 @@ pub const DEFAULT_STATUS_LABELS: &[&str] = &[
 pub struct Cli {
     #[arg(long)]
     pub config: Option<PathBuf>,
-    #[arg(long)]
-    pub gitlab_url: Option<String>,
-    #[arg(long)]
+    #[arg(long, value_name = "URL")]
     pub project: Option<String>,
     #[arg(long)]
     pub token: Option<String>,
-    #[arg(long)]
-    pub theme: Option<String>,
     #[arg(long = "status-label")]
     pub status_labels: Vec<String>,
 }
@@ -37,16 +32,11 @@ pub struct AppConfig {
     pub gitlab_url: String,
     pub project: String,
     pub token: String,
-    pub theme: ThemeName,
     pub status_labels: Vec<String>,
 }
 
 #[derive(Debug, Default, Deserialize)]
 struct FileConfig {
-    gitlab_url: Option<String>,
-    project: Option<String>,
-    token: Option<String>,
-    theme: Option<String>,
     status_labels: Option<Vec<String>>,
 }
 
@@ -55,36 +45,22 @@ impl AppConfig {
         let config_path = cli.config.unwrap_or_else(default_config_path);
         let file_config = read_file_config(&config_path)?;
 
-        let gitlab_url = cli
-            .gitlab_url
-            .or_else(|| env::var("GLISSUES_GITLAB_URL").ok())
-            .or(file_config.gitlab_url)
-            .unwrap_or_else(|| "https://gitlab.cern.ch".to_string());
-
-        let project = cli
+        let project_url = cli
             .project
             .or_else(|| env::var("GLISSUES_PROJECT").ok())
-            .or(file_config.project)
-            .unwrap_or_else(|| "ftorresd/todo".to_string());
+            .or_else(|| env::var("GLISSUES_PROJECT_URL").ok())
+            .ok_or_else(|| {
+                anyhow!(
+                    "missing GitLab project URL; set GLISSUES_PROJECT or pass --project https://gitlab.example.com/group/project"
+                )
+            })?;
+
+        let (gitlab_url, project) = parse_project_url(&project_url)?;
 
         let token = cli
             .token
             .or_else(|| env::var("GLISSUES_TOKEN").ok())
-            .or(file_config.token)
-            .ok_or_else(|| {
-                anyhow!(
-                    "missing GitLab token; set GLISSUES_TOKEN or add token to {}",
-                    config_path.display()
-                )
-            })?;
-
-        let theme = cli
-            .theme
-            .or_else(|| env::var("GLISSUES_THEME").ok())
-            .or(file_config.theme)
-            .map(|value| ThemeName::parse(&value))
-            .transpose()?
-            .unwrap_or(ThemeName::Catppuccin);
+            .ok_or_else(|| anyhow!("missing GitLab token; set GLISSUES_TOKEN or pass --token"))?;
 
         let status_labels = if !cli.status_labels.is_empty() {
             cli.status_labels
@@ -100,10 +76,9 @@ impl AppConfig {
         };
 
         Ok(Self {
-            gitlab_url: gitlab_url.trim_end_matches('/').to_string(),
+            gitlab_url,
             project,
             token,
-            theme,
             status_labels,
         })
     }
@@ -135,4 +110,49 @@ fn split_csv(value: &str) -> Vec<String> {
         .filter(|item| !item.is_empty())
         .map(ToOwned::to_owned)
         .collect()
+}
+
+fn parse_project_url(value: &str) -> Result<(String, String)> {
+    let url = Url::parse(value).with_context(|| format!("invalid project URL '{value}'"))?;
+
+    if !matches!(url.scheme(), "http" | "https") {
+        return Err(anyhow!(
+            "invalid project URL '{value}'; only http and https URLs are supported"
+        ));
+    }
+
+    let host = url
+        .host_str()
+        .ok_or_else(|| anyhow!("invalid project URL '{value}'; missing host"))?;
+
+    let mut segments = url
+        .path_segments()
+        .map(|segments| {
+            segments
+                .take_while(|segment| !segment.is_empty() && *segment != "-")
+                .map(ToOwned::to_owned)
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+
+    if let Some(last) = segments.last_mut() {
+        if last.ends_with(".git") {
+            *last = last.trim_end_matches(".git").to_string();
+        }
+    }
+
+    segments.retain(|segment| !segment.is_empty());
+
+    if segments.len() < 2 {
+        return Err(anyhow!(
+            "invalid project URL '{value}'; expected a GitLab project URL like https://gitlab.example.com/group/project"
+        ));
+    }
+
+    let gitlab_url = match url.port() {
+        Some(port) => format!("{}://{}:{}", url.scheme(), host, port),
+        None => format!("{}://{}", url.scheme(), host),
+    };
+
+    Ok((gitlab_url, segments.join("/")))
 }

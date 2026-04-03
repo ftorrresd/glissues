@@ -40,6 +40,19 @@ pub struct Note {
 }
 
 #[derive(Debug, Clone, Deserialize)]
+pub struct IssueLink {
+    #[serde(default)]
+    pub issue_link_id: u64,
+    pub iid: u64,
+    #[serde(default)]
+    pub title: String,
+    #[serde(default)]
+    pub state: String,
+    #[serde(default)]
+    pub link_type: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
 pub struct ProjectLabel {
     pub name: String,
 }
