@@ -35,16 +35,16 @@ The binary is written to `target/release/glissues`.
 Supported settings:
 
 - `project` as a full GitLab project URL
-- `token`
+- `private_token`
 - `theme`
 
 Environment variables:
 
 - `GLISSUES_PROJECT`
 - `GLISSUES_PROJECT_URL`
-- `GLISSUES_TOKEN`
+- `GLISSUES_PRIVATE_TOKEN`
 
-Project URL and token are mandatory and must be provided through CLI flags or environment variables.
+Project URL and private token are mandatory and must be provided through CLI flags or environment variables.
 The config file in `~/.config/glissues/config.toml` is used for optional local settings like `theme`.
 
 A sample config file is included as `config.example.toml`.
@@ -53,14 +53,14 @@ A sample config file is included as `config.example.toml`.
 
 ```bash
 export GLISSUES_PROJECT="https://gitlab.cern.ch/ftorresd/todo"
-export GLISSUES_TOKEN="your-token"
+export GLISSUES_PRIVATE_TOKEN="your-private-token"
 cargo run --release
 ```
 
 You can also pass the project URL directly:
 
 ```bash
-cargo run --release -- --project "https://gitlab.cern.ch/ftorresd/todo" --token "your-token"
+cargo run --release -- --project "https://gitlab.cern.ch/ftorresd/todo" --private-token "your-private-token"
 ```
 
 ## Install

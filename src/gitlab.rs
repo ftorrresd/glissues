@@ -39,8 +39,9 @@ pub enum StateEvent {
 impl GitLabClient {
     pub fn new(config: &AppConfig) -> Result<Self> {
         let mut headers = HeaderMap::new();
-        let token = HeaderValue::from_str(&config.token).context("invalid GitLab token")?;
-        headers.insert("PRIVATE-TOKEN", token);
+        let private_token =
+            HeaderValue::from_str(&config.private_token).context("invalid GitLab private token")?;
+        headers.insert("PRIVATE-TOKEN", private_token);
 
         let http = Client::builder()
             .default_headers(headers)

@@ -15,15 +15,15 @@ pub struct Cli {
     pub config: Option<PathBuf>,
     #[arg(long, value_name = "URL")]
     pub project: Option<String>,
-    #[arg(long)]
-    pub token: Option<String>,
+    #[arg(long = "private-token")]
+    pub private_token: Option<String>,
 }
 
 #[derive(Debug, Clone)]
 pub struct AppConfig {
     pub gitlab_url: String,
     pub project: String,
-    pub token: String,
+    pub private_token: String,
     pub config_path: PathBuf,
     pub theme: ThemeName,
 }
@@ -50,17 +50,21 @@ impl AppConfig {
 
         let (gitlab_url, project) = parse_project_url(&project_url)?;
 
-        let token = cli
-            .token
-            .or_else(|| env::var("GLISSUES_TOKEN").ok())
-            .ok_or_else(|| anyhow!("missing GitLab token; set GLISSUES_TOKEN or pass --token"))?;
+        let private_token = cli
+            .private_token
+            .or_else(|| env::var("GLISSUES_PRIVATE_TOKEN").ok())
+            .ok_or_else(|| {
+                anyhow!(
+                    "missing GitLab private token; set GLISSUES_PRIVATE_TOKEN or pass --private-token"
+                )
+            })?;
 
         let theme = file_config.theme.unwrap_or(ThemeName::RosePine);
 
         Ok(Self {
             gitlab_url,
             project,
-            token,
+            private_token,
             config_path,
             theme,
         })
@@ -191,7 +195,7 @@ mod tests {
         let config = AppConfig {
             gitlab_url: String::from("https://gitlab.example.com"),
             project: String::from("group/project"),
-            token: String::from("token"),
+            private_token: String::from("private-token"),
             config_path: path.clone(),
             theme: ThemeName::RosePine,
         };

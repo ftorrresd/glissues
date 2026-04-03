@@ -68,9 +68,9 @@ It captures the repository-specific commands, expectations, and coding style.
 ## Run Commands
 
 - Run from env:
-  - `GLISSUES_PROJECT="https://gitlab.example.com/group/project" GLISSUES_TOKEN="..." cargo run --release`
+  - `GLISSUES_PROJECT="https://gitlab.example.com/group/project" GLISSUES_PRIVATE_TOKEN="..." cargo run --release`
 - Run from CLI flags:
-  - `cargo run --release -- --project "https://gitlab.example.com/group/project" --token "..."`
+  - `cargo run --release -- --project "https://gitlab.example.com/group/project" --private-token "..."`
 
 ## GitHub Actions Expectations
 
@@ -129,8 +129,8 @@ It captures the repository-specific commands, expectations, and coding style.
 
 ## Config Rules
 
-- Project URL and token are mandatory from CLI flags or environment.
-- Do not reintroduce default project or token values.
+- Project URL and private token are mandatory from CLI flags or environment.
+- Do not reintroduce default project or private token values.
 - The config file is for optional local state, not secrets required by default.
 - Theme persistence should continue using `~/.config/glissues/config.toml`.
 
