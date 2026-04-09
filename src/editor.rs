@@ -49,12 +49,12 @@ impl TextBuffer {
             self.col -= 1;
         } else if self.row > 0 {
             self.row -= 1;
-            self.col = self.lines[self.row].len();
+            self.col = line_char_len(&self.lines[self.row]);
         }
     }
 
     pub fn move_right(&mut self) {
-        let line_len = self.lines[self.row].len();
+        let line_len = line_char_len(&self.lines[self.row]);
         if self.col < line_len {
             self.col += 1;
         } else if self.row + 1 < self.lines.len() {
@@ -66,14 +66,14 @@ impl TextBuffer {
     pub fn move_up(&mut self) {
         if self.row > 0 {
             self.row -= 1;
-            self.col = self.col.min(self.lines[self.row].len());
+            self.col = self.col.min(line_char_len(&self.lines[self.row]));
         }
     }
 
     pub fn move_down(&mut self) {
         if self.row + 1 < self.lines.len() {
             self.row += 1;
-            self.col = self.col.min(self.lines[self.row].len());
+            self.col = self.col.min(line_char_len(&self.lines[self.row]));
         }
     }
 
@@ -82,11 +82,12 @@ impl TextBuffer {
     }
 
     pub fn move_line_end(&mut self) {
-        self.col = self.lines[self.row].len();
+        self.col = line_char_len(&self.lines[self.row]);
     }
 
     pub fn insert_char(&mut self, ch: char) {
-        self.lines[self.row].insert(self.col, ch);
+        let idx = char_to_byte_idx(&self.lines[self.row], self.col);
+        self.lines[self.row].insert(idx, ch);
         self.col += 1;
     }
 
@@ -97,7 +98,8 @@ impl TextBuffer {
     }
 
     pub fn insert_newline(&mut self) {
-        let tail = self.lines[self.row].split_off(self.col);
+        let idx = char_to_byte_idx(&self.lines[self.row], self.col);
+        let tail = self.lines[self.row].split_off(idx);
         self.row += 1;
         self.col = 0;
         self.lines.insert(self.row, tail);
@@ -106,18 +108,18 @@ impl TextBuffer {
     pub fn backspace(&mut self) {
         if self.col > 0 {
             self.col -= 1;
-            self.lines[self.row].remove(self.col);
+            remove_char_at(&mut self.lines[self.row], self.col);
         } else if self.row > 0 {
             let current = self.lines.remove(self.row);
             self.row -= 1;
-            self.col = self.lines[self.row].len();
+            self.col = line_char_len(&self.lines[self.row]);
             self.lines[self.row].push_str(&current);
         }
     }
 
     pub fn delete(&mut self) {
-        if self.col < self.lines[self.row].len() {
-            self.lines[self.row].remove(self.col);
+        if self.col < line_char_len(&self.lines[self.row]) {
+            remove_char_at(&mut self.lines[self.row], self.col);
         } else if self.row + 1 < self.lines.len() {
             let next = self.lines.remove(self.row + 1);
             self.lines[self.row].push_str(&next);
@@ -175,6 +177,27 @@ impl TextBuffer {
     }
 }
 
+fn line_char_len(line: &str) -> usize {
+    line.chars().count()
+}
+
+fn char_to_byte_idx(line: &str, char_idx: usize) -> usize {
+    if char_idx == 0 {
+        return 0;
+    }
+
+    line.char_indices()
+        .map(|(idx, _)| idx)
+        .nth(char_idx)
+        .unwrap_or(line.len())
+}
+
+fn remove_char_at(line: &mut String, char_idx: usize) {
+    let start = char_to_byte_idx(line, char_idx);
+    let end = char_to_byte_idx(line, char_idx + 1);
+    line.drain(start..end);
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -196,5 +219,35 @@ mod tests {
         buffer.backspace();
 
         assert_eq!(buffer.to_text(), "helloworld");
+    }
+
+    #[test]
+    fn supports_inserting_accented_characters() {
+        let mut buffer = TextBuffer::new();
+        buffer.insert_str("ação ç á ê ã");
+
+        assert_eq!(buffer.to_text(), "ação ç á ê ã");
+        assert_eq!(buffer.col(), 12);
+    }
+
+    #[test]
+    fn backspace_handles_multibyte_characters() {
+        let mut buffer = TextBuffer::from_text("ação");
+        buffer.move_line_end();
+        buffer.backspace();
+        buffer.backspace();
+
+        assert_eq!(buffer.to_text(), "aç");
+        assert_eq!(buffer.col(), 2);
+    }
+
+    #[test]
+    fn newline_split_uses_character_boundaries() {
+        let mut buffer = TextBuffer::from_text("ação");
+        buffer.move_right();
+        buffer.move_right();
+        buffer.insert_newline();
+
+        assert_eq!(buffer.to_text(), "aç\não");
     }
 }

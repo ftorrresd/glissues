@@ -163,6 +163,24 @@ struct LoadingState {
     receiver: Receiver<Result<RefreshPayload, String>>,
 }
 
+enum PendingActionState {
+    IssueSave {
+        draft: IssueEditorState,
+        return_mode: Mode,
+        receiver: Receiver<Result<Issue, String>>,
+    },
+    CommentAdd {
+        draft: CommentEditorState,
+        return_mode: Mode,
+        receiver: Receiver<Result<(u64, Note), String>>,
+    },
+}
+
+enum PendingActionResult {
+    IssueSaved(Issue),
+    CommentAdded { iid: u64, note: Note },
+}
+
 pub struct App {
     pub config: AppConfig,
     pub theme: Theme,
@@ -195,6 +213,7 @@ pub struct App {
     return_mode: Mode,
     pending_g: bool,
     loading: Option<LoadingState>,
+    pending_action: Option<PendingActionState>,
 }
 
 impl App {
@@ -237,6 +256,7 @@ impl App {
             return_mode: Mode::Normal,
             pending_g: false,
             loading: None,
+            pending_action: None,
         })
     }
 
@@ -310,6 +330,33 @@ impl App {
                 Err(error) => self.show_error(format!("refresh failed: {error}")),
             }
         }
+
+        let pending_result = match self.pending_action.as_mut() {
+            Some(PendingActionState::IssueSave { receiver, .. }) => match receiver.try_recv() {
+                Ok(result) => Some(result.map(PendingActionResult::IssueSaved)),
+                Err(TryRecvError::Disconnected) => {
+                    Some(Err(String::from("issue save worker disconnected")))
+                }
+                Err(TryRecvError::Empty) => None,
+            },
+            Some(PendingActionState::CommentAdd { receiver, .. }) => match receiver.try_recv() {
+                Ok(result) => {
+                    Some(result.map(|(iid, note)| PendingActionResult::CommentAdded { iid, note }))
+                }
+                Err(TryRecvError::Disconnected) => {
+                    Some(Err(String::from("comment worker disconnected")))
+                }
+                Err(TryRecvError::Empty) => None,
+            },
+            None => None,
+        };
+
+        if let Some(result) = pending_result {
+            let pending_action = self.pending_action.take();
+            if let Some(pending_action) = pending_action {
+                self.finish_pending_action(pending_action, result);
+            }
+        }
     }
 
     pub fn is_loading(&self) -> bool {
@@ -343,6 +390,15 @@ impl App {
 
     pub fn has_blocker_picker(&self) -> bool {
         self.blocker_picker.is_some()
+    }
+
+    pub fn show_warning(&mut self, message: impl Into<String>) {
+        let message = message.into();
+        self.status_line = first_line(&message);
+        self.alert = Some(AlertState {
+            title: String::from("Warning"),
+            message,
+        });
     }
 
     pub fn show_error(&mut self, message: impl Into<String>) {
@@ -1572,6 +1628,11 @@ impl App {
     }
 
     fn open_issue_editor(&mut self, issue: Option<Issue>) {
+        if self.pending_action.is_some() {
+            self.status_line = String::from("wait for the current background save to finish");
+            return;
+        }
+
         self.capture_return_mode();
         let target_iid = issue.as_ref().map(|item| item.iid);
         if self
@@ -1603,10 +1664,16 @@ impl App {
     }
 
     fn save_issue_editor(&mut self) -> Result<()> {
-        let Some(editor) = self.issue_editor.take() else {
+        let Some(mut editor) = self.issue_editor.take() else {
             return Ok(());
         };
         self.mention_picker = None;
+
+        if self.pending_action.is_some() {
+            self.issue_editor = Some(editor);
+            self.status_line = String::from("wait for the current background save to finish");
+            return Ok(());
+        }
 
         let title = editor.title.to_text().trim().to_string();
         if title.is_empty() {
@@ -1615,32 +1682,60 @@ impl App {
             return Ok(());
         }
 
-        let description = editor.body.to_text();
-        let issue = match editor.editing_iid {
-            Some(iid) => self.client.update_issue(
-                iid,
-                &IssueUpdate {
-                    title: Some(title),
-                    description: Some(description),
-                    ..IssueUpdate::default()
-                },
-            )?,
-            None => self.client.create_issue(&IssueDraft {
-                title,
-                description,
-                labels: vec![self.default_status()],
-                due_date: None,
-            })?,
+        let description = normalized_issue_body(&title, &editor.body.to_text());
+        if !has_meaningful_content(&editor.body.to_text()) {
+            editor.body = TextBuffer::from_text(&description);
+        }
+
+        let client = self.client.clone();
+        let editor_snapshot = editor.clone();
+        let return_mode = self.return_mode;
+        let (sender, receiver) = mpsc::channel();
+        let status_line = match editor.editing_iid {
+            Some(iid) => format!("saving #{} in background", iid),
+            None => String::from("creating issue in background"),
         };
 
-        let iid = issue.iid;
-        self.replace_issue(issue);
+        thread::spawn(move || {
+            let result = (|| -> Result<Issue> {
+                match editor_snapshot.editing_iid {
+                    Some(iid) => client.update_issue(
+                        iid,
+                        &IssueUpdate {
+                            title: Some(title),
+                            description: Some(description),
+                            ..IssueUpdate::default()
+                        },
+                    ),
+                    None => client.create_issue(&IssueDraft {
+                        title,
+                        description,
+                        labels: vec![String::from(DEFAULT_STATUS_LABELS[0])],
+                        due_date: None,
+                    }),
+                }
+            })()
+            .map_err(|error| format!("{error:#}"));
+
+            let _ = sender.send(result);
+        });
+
         self.restore_return_mode();
-        self.status_line = format!("saved #{iid}");
+        self.pending_action = Some(PendingActionState::IssueSave {
+            draft: editor,
+            return_mode,
+            receiver,
+        });
+        self.status_line = status_line;
         Ok(())
     }
 
     fn open_comment_editor(&mut self) {
+        if self.pending_action.is_some() {
+            self.status_line = String::from("wait for the current background save to finish");
+            return;
+        }
+
         let Some(target_iid) = self.selected_issue().map(|issue| issue.iid) else {
             return;
         };
@@ -1669,19 +1764,41 @@ impl App {
             return Ok(());
         };
         self.mention_picker = None;
+
+        if self.pending_action.is_some() {
+            self.comment_editor = Some(editor);
+            self.status_line = String::from("wait for the current background save to finish");
+            return Ok(());
+        }
+
         let iid = editor.target_iid;
 
         let body = editor.body.to_text().trim().to_string();
         if body.is_empty() {
             self.comment_editor = Some(editor);
-            self.status_line = String::from("comment cannot be empty");
+            self.show_warning("comments cannot be empty; please write a message before saving");
             return Ok(());
         }
 
-        let note = self.client.add_note(iid, &body)?;
-        self.notes_cache.entry(iid).or_default().push(note);
+        let client = self.client.clone();
+        let return_mode = self.return_mode;
+        let (sender, receiver) = mpsc::channel();
+
+        thread::spawn(move || {
+            let result = client
+                .add_note(iid, &body)
+                .map(|note| (iid, note))
+                .map_err(|error| format!("{error:#}"));
+            let _ = sender.send(result);
+        });
+
         self.restore_return_mode();
-        self.status_line = format!("comment added to #{iid}");
+        self.pending_action = Some(PendingActionState::CommentAdd {
+            draft: editor,
+            return_mode,
+            receiver,
+        });
+        self.status_line = format!("adding comment to #{} in background", iid);
         Ok(())
     }
 
@@ -1995,6 +2112,55 @@ impl App {
         );
     }
 
+    fn finish_pending_action(
+        &mut self,
+        pending_action: PendingActionState,
+        result: Result<PendingActionResult, String>,
+    ) {
+        match (pending_action, result) {
+            (PendingActionState::IssueSave { .. }, Ok(PendingActionResult::IssueSaved(issue))) => {
+                let iid = issue.iid;
+                self.replace_issue(issue);
+                self.status_line = format!("saved #{}", iid);
+            }
+            (
+                PendingActionState::CommentAdd { .. },
+                Ok(PendingActionResult::CommentAdded { iid, note }),
+            ) => {
+                self.notes_cache.entry(iid).or_default().push(note);
+                if let Some(issue) = self.issues.iter_mut().find(|issue| issue.iid == iid) {
+                    issue.user_notes_count = issue.user_notes_count.saturating_add(1);
+                }
+                self.status_line = format!("comment added to #{}", iid);
+            }
+            (
+                PendingActionState::IssueSave {
+                    draft, return_mode, ..
+                },
+                Err(error),
+            ) => {
+                self.issue_editor = Some(draft);
+                self.return_mode = return_mode;
+                self.mode = Mode::IssueEditor;
+                self.show_error(format!("issue save failed: {error}"));
+            }
+            (
+                PendingActionState::CommentAdd {
+                    draft, return_mode, ..
+                },
+                Err(error),
+            ) => {
+                self.comment_editor = Some(draft);
+                self.return_mode = return_mode;
+                self.mode = Mode::CommentEditor;
+                self.show_error(format!("comment save failed: {error}"));
+            }
+            _ => {
+                self.show_error("background action finished with an unexpected result");
+            }
+        }
+    }
+
     fn capture_return_mode(&mut self) {
         self.return_mode = if matches!(self.mode, Mode::IssueView) {
             Mode::IssueView
@@ -2190,4 +2356,45 @@ fn blocker_matches(link: &IssueLink, query: &str) -> bool {
     }
 
     link.iid.to_string().contains(query) || link.title.to_lowercase().contains(query)
+}
+
+fn has_meaningful_content(value: &str) -> bool {
+    !value.trim().is_empty()
+}
+
+fn normalized_issue_body(title: &str, body: &str) -> String {
+    if has_meaningful_content(body) {
+        body.to_string()
+    } else {
+        title.to_string()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{has_meaningful_content, normalized_issue_body};
+
+    #[test]
+    fn rejects_empty_or_whitespace_only_issue_bodies() {
+        assert!(!has_meaningful_content(""));
+        assert!(!has_meaningful_content("   \t   "));
+        assert!(!has_meaningful_content("\n\n\t\r\n"));
+    }
+
+    #[test]
+    fn accepts_issue_bodies_with_actual_content() {
+        assert!(has_meaningful_content("hello"));
+        assert!(has_meaningful_content("\n  hello\n"));
+    }
+
+    #[test]
+    fn replaces_empty_issue_body_with_title() {
+        assert_eq!(normalized_issue_body("Title", ""), "Title");
+        assert_eq!(normalized_issue_body("Title", " \n\t "), "Title");
+    }
+
+    #[test]
+    fn preserves_non_empty_issue_body() {
+        assert_eq!(normalized_issue_body("Title", "Body"), "Body");
+    }
 }
