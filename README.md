@@ -13,6 +13,8 @@ It is built around the GitLab REST API and supports:
 - blockers
 - due date picking
 - filters for state, label, status, and free-text search
+- multiple stored projects with per-project theme memory
+- plain-text private token storage in the local config file
 
 ## Build
 
@@ -26,17 +28,16 @@ The binary is written to `target/release/glissues`.
 
 ## Configuration
 
-`glissues` reads configuration from the first available source in this order:
+`glissues` reads configuration from these sources:
 
 1. command-line flags
 2. environment variables
 3. `~/.config/glissues/config.toml`
 
-Supported settings:
+CLI / environment settings for opening a new project:
 
 - `project` as a full GitLab project URL
 - `private_token`
-- `theme`
 
 Environment variables:
 
@@ -44,8 +45,19 @@ Environment variables:
 - `GLISSUES_PROJECT_URL`
 - `GLISSUES_PRIVATE_TOKEN`
 
-Project URL and private token are mandatory and must be provided through CLI flags or environment variables.
-The config file in `~/.config/glissues/config.toml` is used for optional local settings like `theme`.
+The config file stores:
+
+- the last opened project
+- the last selected theme
+- stored projects
+- GitLab private tokens in plain text
+
+For a brand-new project, pass a project URL and private token through CLI flags or environment variables.
+When the project is not already stored, `glissues` asks whether you want to save it.
+
+Stored projects can later be opened without passing a private token again because the token is saved directly in `~/.config/glissues/config.toml`.
+
+This is convenient, but it means your stored GitLab tokens are not encrypted at rest.
 
 A sample config file is included as `config.example.toml`.
 
@@ -88,6 +100,9 @@ export PATH="$HOME/.local/bin:$PATH"
 - `j` / `k` or arrows in the issue popup: scroll the issue content
 - `Ctrl-u` / `Ctrl-d`: scroll the open issue faster
 - `Ctrl-r`: refresh from GitLab
+- `p`: open the project picker
+- `P`: cycle to the next known project
+- `[` / `]`: cycle between known projects
 - `t`: open the theme selector and cycle themes with `h`/`l` or arrows
 - `n`: create a new issue
 - `e`: edit selected issue
@@ -126,3 +141,6 @@ Inside the editor/comment popups:
 - GitLab issue `opened` / `closed` remains the source of truth for lifecycle state.
 - Startup and refresh preload issue comments into memory so opening issue details is immediate after loading completes.
 - The UI uses `ratatui-themes` with Rosé Pine as the default theme, and your last chosen theme is remembered in `~/.config/glissues/config.toml`.
+- Stored project private tokens are saved in plain text in `~/.config/glissues/config.toml`.
+- Project data is only fetched when you actually open that project in the current session.
+- New stored projects inherit the current theme, and each stored project remembers its own theme.

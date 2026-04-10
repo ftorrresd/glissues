@@ -21,17 +21,14 @@ use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
 
 use crate::app::App;
-use crate::config::{AppConfig, Cli};
-use crate::gitlab::GitLabClient;
+use crate::config::{BootstrapConfig, Cli};
 
 fn main() -> Result<()> {
     let cli = Cli::parse();
-    let config = AppConfig::load(cli)?;
-    let client = GitLabClient::new(&config)?;
-    let mut app = App::new(config, client)?;
+    let bootstrap = BootstrapConfig::load(cli)?;
+    let mut app = App::new(bootstrap)?;
 
     let mut terminal = setup_terminal()?;
-    app.begin_refresh("Loading GitLab data");
     let result = run_app(&mut terminal, &mut app);
     restore_terminal(&mut terminal)?;
 

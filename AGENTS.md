@@ -17,8 +17,9 @@ It captures the repository-specific commands, expectations, and coding style.
 - It uses the GitLab REST API with blocking `reqwest` calls.
 - The main UI is a list + preview layout with popup overlays.
 - Theme support is implemented through `ratatui-themes`.
-- Startup and refresh preload comments and blocker links into memory.
-- Config lives in `~/.config/glissues/config.toml` for optional local state like theme.
+- Startup and refresh preload comments and blocker links into memory for the active project only.
+- Config lives in `~/.config/glissues/config.toml` and stores multi-project metadata.
+- Stored GitLab private tokens are saved in plain text in the local config file.
 
 ## Important Paths
 
@@ -51,7 +52,7 @@ It captures the repository-specific commands, expectations, and coding style.
 - Run all test targets: `cargo test --all-targets`
 - Run a single test by exact name:
   - `cargo test config::tests::parses_project_url_into_base_and_path -- --exact`
-  - `cargo test config::tests::saves_theme_into_config_file -- --exact`
+  - `cargo test config::tests::stores_theme_per_project -- --exact`
   - `cargo test editor::tests::insert_str_appends_text_at_cursor -- --exact`
 - Run tests matching a substring: `cargo test saves_theme`
 
@@ -129,9 +130,8 @@ It captures the repository-specific commands, expectations, and coding style.
 
 ## Config Rules
 
-- Project URL and private token are mandatory from CLI flags or environment.
-- Do not reintroduce default project or private token values.
-- The config file is for optional local state, not secrets required by default.
+- Project URL and private token are mandatory only when opening an unstored project.
+- The config file stores optional local state, project metadata, last project, per-project theme, and plaintext stored tokens.
 - Theme persistence should continue using `~/.config/glissues/config.toml`.
 
 ## TUI / UX Rules
@@ -143,6 +143,8 @@ It captures the repository-specific commands, expectations, and coding style.
 - Preserve cursor visibility and blinking behavior while text editing.
 - Maintain draft persistence for issue edits and comment drafts.
 - Keep mention picker behavior: typing `#` opens picker, `Enter` inserts `#iid`, `Esc` skips.
+- Multi-project switching should work from a picker and cycle keys without prefetching unopened projects.
+- New stored projects should inherit the current theme.
 
 ## Theme Rules
 
@@ -162,7 +164,7 @@ It captures the repository-specific commands, expectations, and coding style.
 
 - Add unit tests in the same source file under `#[cfg(test)]` when practical.
 - Follow existing inline test style in `src/config.rs` and `src/editor.rs`.
-- Add tests for parsing, config persistence, and pure editing logic first.
+- Add tests for parsing, config persistence, stored project metadata, and pure editing logic first.
 - Avoid brittle TUI snapshot tests unless necessary.
 
 ## Documentation Updates

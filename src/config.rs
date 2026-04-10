@@ -9,7 +9,7 @@ use reqwest::Url;
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Parser)]
-#[command(name = "glissues", version, about = "Yazi-inspired GitLab issues TUI")]
+#[command(name = "glissues", version, about = "GitLab issues TUI")]
 pub struct Cli {
     #[arg(long)]
     pub config: Option<PathBuf>,
@@ -21,58 +21,229 @@ pub struct Cli {
 
 #[derive(Debug, Clone)]
 pub struct AppConfig {
+    pub project_url: String,
     pub gitlab_url: String,
     pub project: String,
     pub private_token: String,
-    pub config_path: PathBuf,
     pub theme: ThemeName,
+    pub stored: bool,
+}
+
+#[derive(Debug, Clone)]
+pub struct StoredProjectConfig {
+    pub project_url: String,
+    pub gitlab_url: String,
+    pub project: String,
+    pub private_token: String,
+    pub theme: ThemeName,
+}
+
+#[derive(Debug, Clone)]
+pub struct ConfigStore {
+    pub config_path: PathBuf,
+    pub last_project: Option<String>,
+    pub last_theme: ThemeName,
+    pub stored_projects: Vec<StoredProjectConfig>,
+}
+
+#[derive(Debug, Clone)]
+pub enum StartupProject {
+    Direct {
+        config: AppConfig,
+        should_prompt_store: bool,
+    },
+    Stored {
+        project_url: String,
+    },
+}
+
+#[derive(Debug, Clone)]
+pub struct BootstrapConfig {
+    pub store: ConfigStore,
+    pub startup: StartupProject,
 }
 
 #[derive(Debug, Default, Deserialize, Serialize)]
 struct FileConfig {
+    last_project: Option<String>,
+    last_theme: Option<ThemeName>,
+    #[serde(default)]
+    projects: Vec<StoredProjectRecord>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+struct StoredProjectRecord {
+    url: String,
+    #[serde(default)]
+    private_token: String,
     theme: Option<ThemeName>,
 }
 
-impl AppConfig {
+impl BootstrapConfig {
     pub fn load(cli: Cli) -> Result<Self> {
         let config_path = cli.config.unwrap_or_else(default_config_path);
         let file_config = read_file_config(&config_path)?;
+        let last_theme = file_config.last_theme.unwrap_or(ThemeName::RosePine);
 
-        let project_url = cli
+        let stored_projects = file_config
+            .projects
+            .into_iter()
+            .map(|record| {
+                let (gitlab_url, project) = parse_project_url(&record.url)?;
+                Ok(StoredProjectConfig {
+                    project_url: record.url,
+                    gitlab_url,
+                    project,
+                    private_token: record.private_token,
+                    theme: record.theme.unwrap_or(last_theme),
+                })
+            })
+            .collect::<Result<Vec<_>>>()?;
+
+        let store = ConfigStore {
+            config_path,
+            last_project: file_config.last_project,
+            last_theme,
+            stored_projects,
+        };
+
+        let startup = if let Some(project_url) = cli
             .project
             .or_else(|| env::var("GLISSUES_PROJECT").ok())
             .or_else(|| env::var("GLISSUES_PROJECT_URL").ok())
-            .ok_or_else(|| {
-                anyhow!(
-                    "missing GitLab project URL; set GLISSUES_PROJECT or pass --project https://gitlab.example.com/group/project"
-                )
-            })?;
+        {
+            let (gitlab_url, project) = parse_project_url(&project_url)?;
+            let private_token = cli
+                .private_token
+                .or_else(|| env::var("GLISSUES_PRIVATE_TOKEN").ok())
+                .ok_or_else(|| {
+                    anyhow!(
+                        "missing GitLab private token; set GLISSUES_PRIVATE_TOKEN or pass --private-token"
+                    )
+                })?;
 
-        let (gitlab_url, project) = parse_project_url(&project_url)?;
+            let theme = store
+                .find_project(&project_url)
+                .map(|project| project.theme)
+                .unwrap_or(store.last_theme);
 
-        let private_token = cli
-            .private_token
-            .or_else(|| env::var("GLISSUES_PRIVATE_TOKEN").ok())
-            .ok_or_else(|| {
-                anyhow!(
-                    "missing GitLab private token; set GLISSUES_PRIVATE_TOKEN or pass --private-token"
-                )
-            })?;
+            StartupProject::Direct {
+                config: AppConfig {
+                    project_url: project_url.clone(),
+                    gitlab_url,
+                    project,
+                    private_token,
+                    theme,
+                    stored: store.find_project(&project_url).is_some(),
+                },
+                should_prompt_store: store.find_project(&project_url).is_none(),
+            }
+        } else if let Some(project_url) = store
+            .last_project
+            .clone()
+            .filter(|url| {
+                store
+                    .find_project(url)
+                    .map(|project| !project.private_token.trim().is_empty())
+                    .unwrap_or(false)
+            })
+            .or_else(|| {
+                store
+                    .stored_projects
+                    .iter()
+                    .find(|project| !project.private_token.trim().is_empty())
+                    .map(|project| project.project_url.clone())
+            })
+        {
+            StartupProject::Stored { project_url }
+        } else if !store.stored_projects.is_empty() {
+            return Err(anyhow!(
+                "stored projects are missing private tokens; reopen a project with --private-token and save it again"
+            ));
+        } else {
+            return Err(anyhow!(
+                "no project configured; pass --project and --private-token or store a project first"
+            ));
+        };
 
-        let theme = file_config.theme.unwrap_or(ThemeName::RosePine);
+        Ok(Self { store, startup })
+    }
+}
 
-        Ok(Self {
+impl ConfigStore {
+    pub fn find_project(&self, project_url: &str) -> Option<&StoredProjectConfig> {
+        self.stored_projects
+            .iter()
+            .find(|project| project.project_url == project_url)
+    }
+
+    pub fn save_project_theme(&mut self, project_url: &str, theme: ThemeName) -> Result<()> {
+        self.last_theme = theme;
+        if let Some(project) = self
+            .stored_projects
+            .iter_mut()
+            .find(|project| project.project_url == project_url)
+        {
+            project.theme = theme;
+        }
+        self.write()
+    }
+
+    pub fn set_last_project(&mut self, project_url: &str) -> Result<()> {
+        self.last_project = Some(project_url.to_string());
+        self.write()
+    }
+
+    pub fn save_last_theme(&mut self, theme: ThemeName) -> Result<()> {
+        self.last_theme = theme;
+        self.write()
+    }
+
+    pub fn store_project(
+        &mut self,
+        project_url: &str,
+        private_token: String,
+        theme: ThemeName,
+    ) -> Result<StoredProjectConfig> {
+        let (gitlab_url, project) = parse_project_url(project_url)?;
+        let stored_project = StoredProjectConfig {
+            project_url: project_url.to_string(),
             gitlab_url,
             project,
             private_token,
-            config_path,
             theme,
-        })
+        };
+
+        if let Some(existing) = self
+            .stored_projects
+            .iter_mut()
+            .find(|project| project.project_url == project_url)
+        {
+            *existing = stored_project.clone();
+        } else {
+            self.stored_projects.push(stored_project.clone());
+        }
+
+        self.last_project = Some(project_url.to_string());
+        self.last_theme = theme;
+        self.write()?;
+        Ok(stored_project)
     }
 
-    pub fn save_theme(&self, theme: ThemeName) -> Result<()> {
-        let mut file_config = read_file_config(&self.config_path)?;
-        file_config.theme = Some(theme);
+    fn write(&self) -> Result<()> {
+        let file_config = FileConfig {
+            last_project: self.last_project.clone(),
+            last_theme: Some(self.last_theme),
+            projects: self
+                .stored_projects
+                .iter()
+                .map(|project| StoredProjectRecord {
+                    url: project.project_url.clone(),
+                    private_token: project.private_token.clone(),
+                    theme: Some(project.theme),
+                })
+                .collect(),
+        };
         write_file_config(&self.config_path, &file_config)
     }
 }
@@ -106,7 +277,7 @@ fn default_config_path() -> PathBuf {
         .join("config.toml")
 }
 
-fn parse_project_url(value: &str) -> Result<(String, String)> {
+pub fn parse_project_url(value: &str) -> Result<(String, String)> {
     let url = Url::parse(value).with_context(|| format!("invalid project URL '{value}'"))?;
 
     if !matches!(url.scheme(), "http" | "https") {
@@ -183,7 +354,7 @@ mod tests {
     }
 
     #[test]
-    fn saves_theme_into_config_file() {
+    fn stores_theme_per_project() {
         let unique = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap()
@@ -192,17 +363,67 @@ mod tests {
             .join(format!("glissues-test-{unique}"))
             .join("config.toml");
 
-        let config = AppConfig {
-            gitlab_url: String::from("https://gitlab.example.com"),
-            project: String::from("group/project"),
-            private_token: String::from("private-token"),
+        let mut store = ConfigStore {
             config_path: path.clone(),
-            theme: ThemeName::RosePine,
+            last_project: Some(String::from("https://gitlab.example.com/group/project")),
+            last_theme: ThemeName::RosePine,
+            stored_projects: vec![StoredProjectConfig {
+                project_url: String::from("https://gitlab.example.com/group/project"),
+                gitlab_url: String::from("https://gitlab.example.com"),
+                project: String::from("group/project"),
+                private_token: String::from("private-token"),
+                theme: ThemeName::RosePine,
+            }],
         };
 
-        config.save_theme(ThemeName::TokyoNight).unwrap();
-        let saved = read_file_config(&path).unwrap();
-        assert_eq!(saved.theme, Some(ThemeName::TokyoNight));
+        store
+            .save_project_theme(
+                "https://gitlab.example.com/group/project",
+                ThemeName::TokyoNight,
+            )
+            .unwrap();
+
+        let raw = fs::read_to_string(&path).unwrap();
+        assert!(raw.contains("theme = \"tokyo-night\""));
+
+        let _ = fs::remove_file(&path);
+        let _ = fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[test]
+    fn stores_plaintext_project_credentials_in_config_file() {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let path = std::env::temp_dir()
+            .join(format!("glissues-test-{unique}"))
+            .join("config.toml");
+
+        let mut store = ConfigStore {
+            config_path: path.clone(),
+            last_project: None,
+            last_theme: ThemeName::RosePine,
+            stored_projects: Vec::new(),
+        };
+
+        let project = store
+            .store_project(
+                "https://gitlab.example.com/group/project",
+                String::from("private-token"),
+                ThemeName::TokyoNight,
+            )
+            .unwrap();
+
+        assert_eq!(project.project, "group/project");
+        assert_eq!(
+            store.last_project.as_deref(),
+            Some("https://gitlab.example.com/group/project")
+        );
+
+        let raw = fs::read_to_string(&path).unwrap();
+        assert!(raw.contains("private_token = \"private-token\""));
+        assert!(raw.contains("theme = \"tokyo-night\""));
 
         let _ = fs::remove_file(&path);
         let _ = fs::remove_dir_all(path.parent().unwrap());

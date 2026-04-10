@@ -79,6 +79,8 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
         Mode::LabelEditor => draw_label_editor(frame, area, app),
         Mode::BlockerPicker => {}
         Mode::ThemePicker => {}
+        Mode::ProjectPicker => {}
+        Mode::StoreProjectPrompt => {}
         Mode::Selector => draw_selector(frame, area, app),
         Mode::DueDatePicker => draw_due_date_picker(frame, area, app),
         Mode::Search | Mode::Command | Mode::Normal => {}
@@ -100,6 +102,14 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
         draw_loading(frame, area, app);
     }
 
+    if app.has_project_picker() {
+        draw_project_picker(frame, area, app);
+    }
+
+    if app.has_store_project_prompt() {
+        draw_store_project_prompt(frame, area, app);
+    }
+
     if app.has_alert() {
         draw_alert(frame, area, app);
     }
@@ -108,9 +118,10 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
 fn draw_header(frame: &mut Frame, area: Rect, app: &App) {
     let c = colors(app.theme.palette());
     let status = format!(
-        " {}  {}  theme:{}  open:{}  closed:{}  overdue:{}  state:{}  label:{}  status:{}  search:{} ",
+        " {}  {}  projects:{}  theme:{}  open:{}  closed:{}  overdue:{}  state:{}  label:{}  status:{}  search:{} ",
         app.mode_label(),
         app.config.project,
+        app.projects.len(),
         app.theme.name.display_name(),
         app.count_open(),
         app.count_closed(),
@@ -322,14 +333,16 @@ fn draw_footer(frame: &mut Frame, area: Rect, app: &App) {
 
     let hints = match app.mode {
         Mode::Normal => {
-            " j/k move  Tab state filter  Enter details  b add blocker  B remove blocker  t themes  n new  e edit  Ctrl-r refresh "
+            " j/k move  Tab state filter  Enter details  p projects  P cycle  b add blocker  t themes  n new  Ctrl-r refresh "
         }
         Mode::IssueView => {
-            " Esc close  e edit  c comment  a labels  b add blocker  B remove blocker  t themes  S status  d due  x close  D delete "
+            " Esc close  e edit  c comment  a labels  b add blocker  B remove blocker  p projects  P cycle  t themes "
         }
-        Mode::ConfirmDelete => " y or Enter confirm delete  n or Esc cancel ",
+        Mode::ConfirmDelete => " y confirm delete  n or Esc cancel ",
         Mode::BlockerPicker => " type to search  Enter apply  Esc cancel ",
         Mode::ThemePicker => " h/Left prev  l/Right next  Enter or Esc close ",
+        Mode::ProjectPicker => " type to filter  Enter open  Esc cancel ",
+        Mode::StoreProjectPrompt => " y store project  n skip storing ",
         Mode::Search => " Enter apply  Esc cancel ",
         Mode::Command => " Enter run command  Esc cancel ",
         _ => " Esc close overlay  Ctrl-s save while editing ",
@@ -365,6 +378,9 @@ fn draw_help(frame: &mut Frame, area: Rect, app: &App) {
         Line::from("Esc            close the issue popup or overlays"),
         Line::from("Tab            cycle all/open/closed filters"),
         Line::from("Ctrl-r         refresh from GitLab with spinner"),
+        Line::from("p              open stored project picker"),
+        Line::from("P              cycle to the next project"),
+        Line::from("[ / ]          cycle previous or next project"),
         Line::from("t              open the theme selector"),
         Line::from("F or l         filter by label"),
         Line::from("s              filter by status"),
@@ -450,7 +466,7 @@ fn draw_confirm_delete(frame: &mut Frame, area: Rect, app: &App) {
         )),
         Line::default(),
         Line::from(Span::styled(
-            "Press y or Enter to delete, n or Esc to cancel.",
+            "Press y to delete, n or Esc to cancel.",
             Style::default().fg(c.muted),
         )),
     ]);
@@ -896,6 +912,131 @@ fn draw_theme_picker(frame: &mut Frame, area: Rect, app: &App) {
 
     frame.render_widget(Clear, popup);
     frame.render_widget(picker, popup);
+}
+
+fn draw_project_picker(frame: &mut Frame, area: Rect, app: &App) {
+    let c = colors(app.theme.palette());
+    let Some(picker) = app.project_picker.as_ref() else {
+        return;
+    };
+
+    let popup = centered_rect(74, 64, area);
+    let sections = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(3),
+            Constraint::Min(8),
+            Constraint::Length(1),
+        ])
+        .margin(1)
+        .split(popup);
+
+    let candidates = app.project_picker_candidates();
+    let items = if candidates.is_empty() {
+        vec![ListItem::new(Line::from(Span::styled(
+            "No projects match the current filter.",
+            Style::default().fg(c.muted),
+        )))]
+    } else {
+        candidates
+            .iter()
+            .map(|project| {
+                let state = if project.project_url == app.current_project_url {
+                    "active"
+                } else if app.is_project_loaded(&project.project_url) {
+                    "loaded"
+                } else if project.stored {
+                    "stored"
+                } else {
+                    "session"
+                };
+                ListItem::new(vec![
+                    Line::from(vec![
+                        Span::styled(project.project.clone(), Style::default().fg(c.accent)),
+                        Span::raw("  "),
+                        Span::styled(state, Style::default().fg(c.muted)),
+                    ]),
+                    Line::from(Span::styled(
+                        project.project_url.clone(),
+                        Style::default().fg(c.text),
+                    )),
+                ])
+            })
+            .collect()
+    };
+
+    frame.render_widget(Clear, popup);
+    frame.render_widget(
+        Block::default()
+            .borders(Borders::ALL)
+            .title("Projects")
+            .style(Style::default().bg(c.panel).fg(c.text)),
+        popup,
+    );
+    frame.render_widget(
+        Paragraph::new(picker.query.as_str())
+            .block(styled_block(c, "Filter"))
+            .style(Style::default().bg(c.panel_alt).fg(c.text)),
+        sections[0],
+    );
+
+    let list = List::new(items)
+        .block(styled_block(c, "Available Projects"))
+        .highlight_symbol("▎")
+        .highlight_style(
+            Style::default()
+                .bg(c.panel_alt)
+                .fg(c.text)
+                .add_modifier(Modifier::BOLD),
+        );
+    let mut state = ListState::default();
+    if !candidates.is_empty() {
+        state.select(Some(picker.cursor.min(candidates.len() - 1)));
+    }
+    frame.render_stateful_widget(list, sections[1], &mut state);
+    frame.render_widget(
+        Paragraph::new("type to filter  Enter open  Esc cancel")
+            .style(Style::default().fg(c.muted).bg(c.panel)),
+        sections[2],
+    );
+}
+
+fn draw_store_project_prompt(frame: &mut Frame, area: Rect, app: &App) {
+    let c = colors(app.theme.palette());
+    let Some(prompt) = app.store_project_prompt.as_ref() else {
+        return;
+    };
+    let popup = centered_rect(58, 28, area);
+    let text = Text::from(vec![
+        Line::from(Span::styled(
+            "Store this project for later?",
+            Style::default().fg(c.accent).add_modifier(Modifier::BOLD),
+        )),
+        Line::default(),
+        Line::from(Span::styled(
+            prompt.project_url.clone(),
+            Style::default().fg(c.text),
+        )),
+        Line::default(),
+        Line::from(Span::styled(
+            "The GitLab private token will be saved in plain text in the config file.",
+            Style::default().fg(c.muted),
+        )),
+        Line::default(),
+        Line::from(Span::styled(
+            "Press y to store it or n to keep it only for this session.",
+            Style::default().fg(c.warn),
+        )),
+    ]);
+
+    frame.render_widget(Clear, popup);
+    frame.render_widget(
+        Paragraph::new(text)
+            .block(pane_block(c, "Store Project", true))
+            .style(Style::default().bg(c.panel).fg(c.text))
+            .wrap(Wrap { trim: false }),
+        popup,
+    );
 }
 
 fn draw_due_date_picker(frame: &mut Frame, area: Rect, app: &App) {

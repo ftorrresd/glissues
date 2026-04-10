@@ -7,7 +7,7 @@ use chrono::{Datelike, Duration, Local, NaiveDate};
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui_themes::Theme;
 
-use crate::config::AppConfig;
+use crate::config::{AppConfig, BootstrapConfig, ConfigStore, StartupProject};
 use crate::editor::TextBuffer;
 use crate::gitlab::{GitLabClient, IssueDraft, IssueUpdate, StateEvent};
 use crate::model::{Issue, IssueLink, Note};
@@ -27,6 +27,8 @@ pub enum Mode {
     ConfirmDelete,
     BlockerPicker,
     ThemePicker,
+    ProjectPicker,
+    StoreProjectPrompt,
     Search,
     Command,
     IssueEditor,
@@ -149,6 +151,45 @@ pub struct BlockerCandidate {
     pub issue_link_id: Option<u64>,
 }
 
+#[derive(Debug, Clone)]
+pub struct ProjectPickerState {
+    pub query: String,
+    pub cursor: usize,
+}
+
+#[derive(Debug, Clone)]
+pub struct StoreProjectPromptState {
+    pub project_url: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct ProjectMeta {
+    pub project_url: String,
+    pub gitlab_url: String,
+    pub project: String,
+    pub theme: ratatui_themes::ThemeName,
+    pub stored: bool,
+    pub private_token: Option<String>,
+}
+
+#[derive(Clone)]
+struct ProjectSession {
+    config: AppConfig,
+    theme: Theme,
+    client: GitLabClient,
+    issues: Vec<Issue>,
+    labels: Vec<String>,
+    notes_cache: HashMap<u64, Vec<Note>>,
+    issue_links_cache: HashMap<u64, Vec<IssueLink>>,
+    filters: Filters,
+    selected: usize,
+    issue_view_scroll: u16,
+    issue_view_view_height: u16,
+    issue_view_content_height: u16,
+    issue_editor: Option<IssueEditorState>,
+    comment_editor: Option<CommentEditorState>,
+}
+
 struct RefreshPayload {
     issues: Vec<Issue>,
     labels: Vec<String>,
@@ -182,9 +223,13 @@ enum PendingActionResult {
 }
 
 pub struct App {
+    pub store: ConfigStore,
     pub config: AppConfig,
     pub theme: Theme,
     client: GitLabClient,
+    pub current_project_url: String,
+    pub projects: Vec<ProjectMeta>,
+    inactive_sessions: HashMap<String, ProjectSession>,
     pub issues: Vec<Issue>,
     pub labels: Vec<String>,
     pub notes_cache: HashMap<u64, Vec<Note>>,
@@ -210,6 +255,8 @@ pub struct App {
     pub alert: Option<AlertState>,
     pub mention_picker: Option<MentionPickerState>,
     pub blocker_picker: Option<BlockerPickerState>,
+    pub project_picker: Option<ProjectPickerState>,
+    pub store_project_prompt: Option<StoreProjectPromptState>,
     return_mode: Mode,
     pending_g: bool,
     loading: Option<LoadingState>,
@@ -217,12 +264,46 @@ pub struct App {
 }
 
 impl App {
-    pub fn new(config: AppConfig, client: GitLabClient) -> Result<Self> {
+    pub fn new(bootstrap: BootstrapConfig) -> Result<Self> {
+        let (config, current_project_url, prompt_store) = match &bootstrap.startup {
+            StartupProject::Direct {
+                config,
+                should_prompt_store,
+            } => (
+                config.clone(),
+                config.project_url.clone(),
+                *should_prompt_store,
+            ),
+            StartupProject::Stored { project_url } => {
+                let project = bootstrap
+                    .store
+                    .find_project(project_url)
+                    .ok_or_else(|| anyhow!("stored project not found: {project_url}"))?;
+                (
+                    AppConfig {
+                        project_url: project.project_url.clone(),
+                        gitlab_url: project.gitlab_url.clone(),
+                        project: project.project.clone(),
+                        private_token: project.private_token.clone(),
+                        theme: project.theme,
+                        stored: true,
+                    },
+                    project.project_url.clone(),
+                    false,
+                )
+            }
+        };
+
         let theme_name = config.theme;
-        Ok(Self {
+        let client = GitLabClient::new(&config)?;
+        let mut app = Self {
+            store: bootstrap.store.clone(),
             config,
             theme: Theme::new(theme_name),
             client,
+            current_project_url,
+            projects: project_metas_from_store(&bootstrap.store),
+            inactive_sessions: HashMap::new(),
             issues: Vec::new(),
             labels: Vec::new(),
             notes_cache: HashMap::new(),
@@ -253,11 +334,45 @@ impl App {
             alert: None,
             mention_picker: None,
             blocker_picker: None,
+            project_picker: None,
+            store_project_prompt: None,
             return_mode: Mode::Normal,
             pending_g: false,
             loading: None,
             pending_action: None,
-        })
+        };
+
+        if !app
+            .projects
+            .iter()
+            .any(|project| project.project_url == app.current_project_url)
+        {
+            app.projects.push(ProjectMeta {
+                project_url: app.config.project_url.clone(),
+                gitlab_url: app.config.gitlab_url.clone(),
+                project: app.config.project.clone(),
+                theme: app.config.theme,
+                stored: app.config.stored,
+                private_token: Some(app.config.private_token.clone()),
+            });
+        }
+
+        match bootstrap.startup {
+            StartupProject::Direct { .. } => {
+                app.begin_refresh("Loading GitLab data");
+                if prompt_store {
+                    app.store_project_prompt = Some(StoreProjectPromptState {
+                        project_url: app.current_project_url.clone(),
+                    });
+                    app.mode = Mode::StoreProjectPrompt;
+                }
+            }
+            StartupProject::Stored { .. } => {
+                app.begin_refresh("Loading GitLab data");
+            }
+        }
+
+        Ok(app)
     }
 
     pub fn begin_refresh(&mut self, message: &str) {
@@ -273,7 +388,7 @@ impl App {
         thread::spawn(move || {
             let result = (|| -> Result<RefreshPayload> {
                 let mut issues = client.list_issues()?;
-                issues.sort_by(|left, right| right.updated_at.cmp(&left.updated_at));
+                issues.sort_by_key(|issue| issue.iid);
                 let labels = client.list_labels()?;
                 let mut notes_cache = HashMap::new();
                 let mut issue_links_cache = HashMap::new();
@@ -392,6 +507,18 @@ impl App {
         self.blocker_picker.is_some()
     }
 
+    pub fn has_project_picker(&self) -> bool {
+        self.project_picker.is_some()
+    }
+
+    pub fn has_store_project_prompt(&self) -> bool {
+        self.store_project_prompt.is_some()
+    }
+
+    pub fn is_project_loaded(&self, project_url: &str) -> bool {
+        self.current_project_url == project_url || self.inactive_sessions.contains_key(project_url)
+    }
+
     pub fn show_warning(&mut self, message: impl Into<String>) {
         let message = message.into();
         self.status_line = first_line(&message);
@@ -425,7 +552,7 @@ impl App {
             return Ok(());
         }
 
-        if self.is_loading() {
+        if self.is_loading() && !matches!(self.mode, Mode::StoreProjectPrompt) {
             return Ok(());
         }
 
@@ -435,6 +562,8 @@ impl App {
             Mode::ConfirmDelete => self.handle_confirm_delete_mode(key),
             Mode::BlockerPicker => self.handle_blocker_picker_mode(key),
             Mode::ThemePicker => self.handle_theme_picker_mode(key),
+            Mode::ProjectPicker => self.handle_project_picker_mode(key),
+            Mode::StoreProjectPrompt => self.handle_store_project_prompt_mode(key),
             Mode::Search => self.handle_search_mode(key),
             Mode::Command => self.handle_command_mode(key),
             Mode::IssueEditor => self.handle_issue_editor_mode(key),
@@ -511,6 +640,8 @@ impl App {
             Mode::ConfirmDelete => "DELETE",
             Mode::BlockerPicker => "BLOCKERS",
             Mode::ThemePicker => "THEMES",
+            Mode::ProjectPicker => "PROJECTS",
+            Mode::StoreProjectPrompt => "STORE",
             Mode::Search => "SEARCH",
             Mode::Command => "COMMAND",
             Mode::IssueEditor => "EDITOR",
@@ -624,6 +755,22 @@ impl App {
                 self.pending_g = false;
                 self.capture_return_mode();
                 self.mode = Mode::ThemePicker;
+            }
+            KeyCode::Char('p') => {
+                self.pending_g = false;
+                self.open_project_picker();
+            }
+            KeyCode::Char('P') => {
+                self.pending_g = false;
+                self.cycle_project(1)?;
+            }
+            KeyCode::Char('[') => {
+                self.pending_g = false;
+                self.cycle_project(-1)?;
+            }
+            KeyCode::Char(']') => {
+                self.pending_g = false;
+                self.cycle_project(1)?;
             }
             KeyCode::Char('c') => {
                 self.pending_g = false;
@@ -775,6 +922,22 @@ impl App {
                 self.capture_return_mode();
                 self.mode = Mode::ThemePicker;
             }
+            KeyCode::Char('p') => {
+                self.pending_g = false;
+                self.open_project_picker();
+            }
+            KeyCode::Char('P') => {
+                self.pending_g = false;
+                self.cycle_project(1)?;
+            }
+            KeyCode::Char('[') => {
+                self.pending_g = false;
+                self.cycle_project(-1)?;
+            }
+            KeyCode::Char(']') => {
+                self.pending_g = false;
+                self.cycle_project(1)?;
+            }
             KeyCode::Char('H') => {
                 self.pending_g = false;
                 self.move_selected_issue_status(-1)?;
@@ -824,7 +987,7 @@ impl App {
                 self.delete_confirmation = None;
                 self.restore_return_mode();
             }
-            KeyCode::Char('y') | KeyCode::Enter => self.confirm_delete_issue()?,
+            KeyCode::Char('y') => self.confirm_delete_issue()?,
             _ => {}
         }
 
@@ -883,13 +1046,84 @@ impl App {
             }
             KeyCode::Left | KeyCode::Char('h') => {
                 self.theme.prev();
-                self.config.save_theme(self.theme.name)?;
+                self.config.theme = self.theme.name;
+                self.update_project_theme(self.current_project_url.clone(), self.theme.name)?;
                 self.status_line = format!("theme: {}", self.theme.name.display_name());
             }
             KeyCode::Right | KeyCode::Char('l') => {
                 self.theme.next();
-                self.config.save_theme(self.theme.name)?;
+                self.config.theme = self.theme.name;
+                self.update_project_theme(self.current_project_url.clone(), self.theme.name)?;
                 self.status_line = format!("theme: {}", self.theme.name.display_name());
+            }
+            _ => {}
+        }
+
+        Ok(())
+    }
+
+    fn handle_project_picker_mode(&mut self, key: KeyEvent) -> Result<()> {
+        if self.project_picker.is_none() {
+            self.restore_return_mode();
+            return Ok(());
+        }
+
+        match key.code {
+            KeyCode::Esc => {
+                self.project_picker = None;
+                self.restore_return_mode();
+            }
+            KeyCode::Enter => {
+                let project_url = self.current_project_picker_choice();
+                self.project_picker = None;
+                self.restore_return_mode();
+                if let Some(project_url) = project_url {
+                    self.request_project_activation(&project_url)?;
+                }
+            }
+            KeyCode::Backspace => {
+                if let Some(picker) = self.project_picker.as_mut() {
+                    picker.query.pop();
+                    picker.cursor = 0;
+                }
+            }
+            KeyCode::Char('j') | KeyCode::Down => {
+                let count = self.project_picker_candidates().len().max(1);
+                if let Some(picker) = self.project_picker.as_mut() {
+                    picker.cursor = (picker.cursor + 1).min(count - 1);
+                }
+            }
+            KeyCode::Char('k') | KeyCode::Up => {
+                if let Some(picker) = self.project_picker.as_mut() {
+                    picker.cursor = picker.cursor.saturating_sub(1);
+                }
+            }
+            KeyCode::Char(ch)
+                if !key
+                    .modifiers
+                    .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
+            {
+                if let Some(picker) = self.project_picker.as_mut() {
+                    picker.query.push(ch);
+                    picker.cursor = 0;
+                }
+            }
+            _ => {}
+        }
+
+        Ok(())
+    }
+
+    fn handle_store_project_prompt_mode(&mut self, key: KeyEvent) -> Result<()> {
+        match key.code {
+            KeyCode::Char('y') => {
+                self.persist_current_project()?;
+                self.store_project_prompt = None;
+                self.restore_return_mode();
+            }
+            KeyCode::Esc | KeyCode::Char('n') => {
+                self.store_project_prompt = None;
+                self.restore_return_mode();
             }
             _ => {}
         }
@@ -1361,12 +1595,300 @@ impl App {
             .cloned()
     }
 
+    pub fn project_picker_candidates(&self) -> Vec<ProjectMeta> {
+        let query = self
+            .project_picker
+            .as_ref()
+            .map(|picker| picker.query.trim().to_lowercase())
+            .unwrap_or_default();
+
+        self.projects
+            .iter()
+            .filter(|project| {
+                if query.is_empty() {
+                    true
+                } else {
+                    project.project_url.to_lowercase().contains(&query)
+                        || project.project.to_lowercase().contains(&query)
+                }
+            })
+            .cloned()
+            .collect()
+    }
+
+    fn current_project_picker_choice(&self) -> Option<String> {
+        let candidates = self.project_picker_candidates();
+        let cursor = self.project_picker.as_ref()?.cursor;
+        candidates
+            .get(cursor.min(candidates.len().saturating_sub(1)))
+            .map(|project| project.project_url.clone())
+    }
+
     fn open_issue_view(&mut self) -> Result<()> {
         self.issue_view_scroll = 0;
         self.ensure_selected_notes_loaded()?;
         self.ensure_selected_issue_links_loaded()?;
         self.mode = Mode::IssueView;
         Ok(())
+    }
+
+    fn open_project_picker(&mut self) {
+        if !self.can_switch_projects() {
+            return;
+        }
+
+        self.capture_return_mode();
+        self.project_picker = Some(ProjectPickerState {
+            query: String::new(),
+            cursor: self.current_project_index().unwrap_or(0),
+        });
+        self.mode = Mode::ProjectPicker;
+    }
+
+    fn cycle_project(&mut self, delta: isize) -> Result<()> {
+        if !self.can_switch_projects() || self.projects.is_empty() {
+            return Ok(());
+        }
+
+        let current = self.current_project_index().unwrap_or(0);
+        let next = (current as isize + delta).rem_euclid(self.projects.len() as isize) as usize;
+        let project_url = self.projects[next].project_url.clone();
+        self.request_project_activation(&project_url)
+    }
+
+    fn request_project_activation(&mut self, project_url: &str) -> Result<()> {
+        if self.current_project_url == project_url {
+            return Ok(());
+        }
+
+        if let Some(session) = self.inactive_sessions.remove(project_url) {
+            self.activate_existing_session(project_url, session)?;
+            return Ok(());
+        }
+
+        let meta = self
+            .projects
+            .iter()
+            .find(|project| project.project_url == project_url)
+            .cloned()
+            .ok_or_else(|| anyhow!("unknown project: {project_url}"))?;
+
+        self.activate_new_project(meta)?;
+
+        Ok(())
+    }
+
+    fn activate_existing_session(
+        &mut self,
+        project_url: &str,
+        session: ProjectSession,
+    ) -> Result<()> {
+        self.stash_current_session();
+        self.restore_session(session);
+        self.current_project_url = project_url.to_string();
+        self.mode = Mode::Normal;
+        self.store.set_last_project(project_url)?;
+        Ok(())
+    }
+
+    fn activate_new_project(&mut self, meta: ProjectMeta) -> Result<()> {
+        self.stash_current_session();
+
+        let private_token = meta
+            .private_token
+            .clone()
+            .ok_or_else(|| anyhow!("stored project is missing a private token"))?;
+
+        self.config = AppConfig {
+            project_url: meta.project_url.clone(),
+            gitlab_url: meta.gitlab_url.clone(),
+            project: meta.project.clone(),
+            private_token,
+            theme: meta.theme,
+            stored: meta.stored,
+        };
+        self.client = GitLabClient::new(&self.config)?;
+        self.theme = Theme::new(meta.theme);
+        self.current_project_url = meta.project_url.clone();
+        self.clear_active_project_state();
+        self.mode = Mode::Normal;
+        self.store.set_last_project(&meta.project_url)?;
+        self.begin_refresh(&format!("Loading {}", self.config.project));
+        Ok(())
+    }
+
+    fn stash_current_session(&mut self) {
+        if self.current_project_url.is_empty() {
+            return;
+        }
+
+        self.inactive_sessions.insert(
+            self.current_project_url.clone(),
+            ProjectSession {
+                config: self.config.clone(),
+                theme: self.theme.clone(),
+                client: self.client.clone(),
+                issues: self.issues.clone(),
+                labels: self.labels.clone(),
+                notes_cache: self.notes_cache.clone(),
+                issue_links_cache: self.issue_links_cache.clone(),
+                filters: self.filters.clone(),
+                selected: self.selected,
+                issue_view_scroll: self.issue_view_scroll,
+                issue_view_view_height: self.issue_view_view_height,
+                issue_view_content_height: self.issue_view_content_height,
+                issue_editor: self.issue_editor.clone(),
+                comment_editor: self.comment_editor.clone(),
+            },
+        );
+    }
+
+    fn restore_session(&mut self, session: ProjectSession) {
+        self.config = session.config;
+        self.theme = session.theme;
+        self.client = session.client;
+        self.issues = session.issues;
+        self.labels = session.labels;
+        self.notes_cache = session.notes_cache;
+        self.issue_links_cache = session.issue_links_cache;
+        self.filters = session.filters;
+        self.selected = session.selected;
+        self.issue_view_scroll = session.issue_view_scroll;
+        self.issue_view_view_height = session.issue_view_view_height;
+        self.issue_view_content_height = session.issue_view_content_height;
+        self.issue_editor = session.issue_editor;
+        self.comment_editor = session.comment_editor;
+        self.label_picker = None;
+        self.selector = None;
+        self.selector_kind = None;
+        self.due_date_picker = None;
+        self.delete_confirmation = None;
+        self.alert = None;
+        self.mention_picker = None;
+        self.blocker_picker = None;
+        self.project_picker = None;
+        self.store_project_prompt = None;
+        self.return_mode = Mode::Normal;
+        self.pending_g = false;
+        self.loading = None;
+        self.pending_action = None;
+    }
+
+    fn clear_active_project_state(&mut self) {
+        self.issues.clear();
+        self.labels.clear();
+        self.notes_cache.clear();
+        self.issue_links_cache.clear();
+        self.filters = Filters {
+            state: StateFilter::Open,
+            label: None,
+            status: None,
+            search: String::new(),
+        };
+        self.selected = 0;
+        self.issue_view_scroll = 0;
+        self.issue_view_view_height = 0;
+        self.issue_view_content_height = 0;
+        self.search_input.clear();
+        self.command_input.clear();
+        self.search_backup.clear();
+        self.issue_editor = None;
+        self.comment_editor = None;
+        self.label_picker = None;
+        self.selector = None;
+        self.selector_kind = None;
+        self.due_date_picker = None;
+        self.delete_confirmation = None;
+        self.alert = None;
+        self.mention_picker = None;
+        self.blocker_picker = None;
+        self.project_picker = None;
+        self.store_project_prompt = None;
+        self.return_mode = Mode::Normal;
+        self.pending_g = false;
+        self.loading = None;
+        self.pending_action = None;
+    }
+
+    fn persist_current_project(&mut self) -> Result<()> {
+        if self.config.stored {
+            self.status_line = String::from("project already stored");
+            return Ok(());
+        }
+
+        let stored_project = self.store.store_project(
+            &self.config.project_url,
+            self.config.private_token.clone(),
+            self.theme.name,
+        )?;
+
+        self.config.stored = true;
+        self.update_project_meta(ProjectMeta {
+            project_url: stored_project.project_url.clone(),
+            gitlab_url: stored_project.gitlab_url.clone(),
+            project: stored_project.project.clone(),
+            theme: stored_project.theme,
+            stored: true,
+            private_token: Some(stored_project.private_token.clone()),
+        });
+        self.status_line = String::from("stored project configuration");
+        Ok(())
+    }
+
+    fn update_project_theme(
+        &mut self,
+        project_url: String,
+        theme: ratatui_themes::ThemeName,
+    ) -> Result<()> {
+        if let Some(project) = self
+            .projects
+            .iter_mut()
+            .find(|project| project.project_url == project_url)
+        {
+            project.theme = theme;
+        }
+
+        if self.config.stored {
+            self.store.save_project_theme(&project_url, theme)
+        } else {
+            self.store.save_last_theme(theme)
+        }
+    }
+
+    fn current_project_index(&self) -> Option<usize> {
+        self.projects
+            .iter()
+            .position(|project| project.project_url == self.current_project_url)
+    }
+
+    fn can_switch_projects(&mut self) -> bool {
+        if self.loading.is_some() || self.pending_action.is_some() {
+            self.status_line = String::from("wait for the current project action to finish");
+            return false;
+        }
+
+        if !matches!(self.mode, Mode::Normal | Mode::IssueView) {
+            self.status_line = String::from("close the current popup before switching projects");
+            return false;
+        }
+
+        true
+    }
+    fn update_project_meta(&mut self, meta: ProjectMeta) {
+        if let Some(existing) = self
+            .projects
+            .iter_mut()
+            .find(|project| project.project_url == meta.project_url)
+        {
+            *existing = meta;
+        } else {
+            self.projects.push(meta);
+        }
+        self.projects.sort_by(|left, right| {
+            left.project
+                .cmp(&right.project)
+                .then(left.project_url.cmp(&right.project_url))
+        });
     }
 
     fn open_blocker_picker(&mut self, action: BlockerAction) {
@@ -2085,8 +2607,7 @@ impl App {
             self.issues.insert(0, issue);
         }
 
-        self.issues
-            .sort_by(|left, right| right.updated_at.cmp(&left.updated_at));
+        self.issues.sort_by_key(|issue| issue.iid);
         self.rebuild_label_catalog();
         self.restore_selection(Some(iid));
     }
@@ -2174,6 +2695,8 @@ impl App {
         self.return_mode = Mode::Normal;
         self.mention_picker = None;
         self.blocker_picker = None;
+        self.project_picker = None;
+        self.store_project_prompt = None;
     }
 
     fn mention_target_buffer_mut(&mut self, target: MentionTarget) -> Option<&mut TextBuffer> {
@@ -2368,6 +2891,27 @@ fn normalized_issue_body(title: &str, body: &str) -> String {
     } else {
         title.to_string()
     }
+}
+
+fn project_metas_from_store(store: &ConfigStore) -> Vec<ProjectMeta> {
+    let mut projects = store
+        .stored_projects
+        .iter()
+        .map(|project| ProjectMeta {
+            project_url: project.project_url.clone(),
+            gitlab_url: project.gitlab_url.clone(),
+            project: project.project.clone(),
+            theme: project.theme,
+            stored: true,
+            private_token: Some(project.private_token.clone()),
+        })
+        .collect::<Vec<_>>();
+    projects.sort_by(|left, right| {
+        left.project
+            .cmp(&right.project)
+            .then(left.project_url.cmp(&right.project_url))
+    });
+    projects
 }
 
 #[cfg(test)]
