@@ -6,6 +6,7 @@ use serde::de::DeserializeOwned;
 use crate::config::AppConfig;
 use crate::model::{Issue, IssueLink, Note, ProjectLabel};
 
+#[allow(dead_code)]
 #[derive(Debug, Clone)]
 pub struct GitLabClient {
     http: Client,
@@ -36,6 +37,7 @@ pub enum StateEvent {
     Reopen,
 }
 
+#[allow(dead_code)]
 impl GitLabClient {
     pub fn new(config: &AppConfig) -> Result<Self> {
         let mut headers = HeaderMap::new();

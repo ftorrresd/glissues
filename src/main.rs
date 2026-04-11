@@ -1,4 +1,5 @@
 mod app;
+mod background;
 mod config;
 mod editor;
 mod gitlab;

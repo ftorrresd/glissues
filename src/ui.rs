@@ -118,7 +118,7 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
 fn draw_header(frame: &mut Frame, area: Rect, app: &App) {
     let c = colors(app.theme.palette());
     let status = format!(
-        " {}  {}  projects:{}  theme:{}  open:{}  closed:{}  overdue:{}  state:{}  label:{}  status:{}  search:{} ",
+        " {}  {}  projects:{}  theme:{}  open:{}  closed:{}  overdue:{}  state:{}  label:{}  search:{} ",
         app.mode_label(),
         app.config.project,
         app.projects.len(),
@@ -128,7 +128,6 @@ fn draw_header(frame: &mut Frame, area: Rect, app: &App) {
         app.count_overdue(),
         app.state_label(),
         app.filters.label.as_deref().unwrap_or("any"),
-        app.filters.status.as_deref().unwrap_or("any"),
         if app.filters.search.is_empty() {
             "off"
         } else {
@@ -175,13 +174,6 @@ fn draw_sidebar(frame: &mut Frame, area: Rect, app: &App) {
             Span::styled("Label  ", Style::default().fg(c.muted)),
             Span::styled(
                 app.filters.label.as_deref().unwrap_or("any"),
-                Style::default().fg(c.text),
-            ),
-        ]),
-        Line::from(vec![
-            Span::styled("Status ", Style::default().fg(c.muted)),
-            Span::styled(
-                app.filters.status.as_deref().unwrap_or("any"),
                 Style::default().fg(c.text),
             ),
         ]),
@@ -251,9 +243,6 @@ fn draw_issue_list(frame: &mut Frame, area: Rect, app: &App) {
             Style::default().fg(c.muted)
         };
 
-        let status = app
-            .issue_status(issue)
-            .unwrap_or_else(|| String::from("status::none"));
         let due = issue
             .due_date
             .clone()
@@ -261,19 +250,15 @@ fn draw_issue_list(frame: &mut Frame, area: Rect, app: &App) {
         let labels = issue
             .labels
             .iter()
-            .filter(|label| !label.starts_with("status::"))
             .take(3)
             .cloned()
             .collect::<Vec<_>>()
             .join(", ");
 
         let meta = if labels.is_empty() {
-            format!("{}  {}  {} comments", status, due, issue.user_notes_count)
+            format!("{}  {} comments", due, issue.user_notes_count)
         } else {
-            format!(
-                "{}  {}  {}  {} comments",
-                status, due, labels, issue.user_notes_count
-            )
+            format!("{}  {}  {} comments", due, labels, issue.user_notes_count)
         };
 
         items.push(ListItem::new(vec![
@@ -383,19 +368,17 @@ fn draw_help(frame: &mut Frame, area: Rect, app: &App) {
         Line::from("[ / ]          cycle previous or next project"),
         Line::from("t              open the theme selector"),
         Line::from("F or l         filter by label"),
-        Line::from("s              filter by status"),
         Line::from("/              fuzzy-like text filter"),
         Line::from("n              create a new issue"),
         Line::from("e              edit title and body"),
         Line::from("c              add a comment"),
         Line::from("a              edit labels"),
         Line::from("b / B          add or remove blockers"),
-        Line::from("S              set issue status directly"),
         Line::from("d              open the due date picker"),
         Line::from("x              close or reopen the selected issue"),
         Line::from("D              delete the selected issue after confirmation"),
         Line::from(
-            "Inside popup   e edit, c comment, a labels, b/B blockers, S status, d due, x close/reopen, H/L move, D delete",
+            "Inside popup   e edit, c comment, a labels, b/B blockers, d due, x close/reopen, D delete",
         ),
         Line::from(
             "Inside editors type # to mention an issue, Enter to insert #iid, or Esc to skip",
@@ -941,20 +924,22 @@ fn draw_project_picker(frame: &mut Frame, area: Rect, app: &App) {
         candidates
             .iter()
             .map(|project| {
-                let state = if project.project_url == app.current_project_url {
-                    "active"
+                let (state, color) = if project.project_url == app.current_project_url {
+                    (String::from("active"), c.muted)
+                } else if let Some(state) = app.project_load_label(&project.project_url) {
+                    (state, c.warn)
                 } else if app.is_project_loaded(&project.project_url) {
-                    "loaded"
+                    (String::from("loaded"), c.muted)
                 } else if project.stored {
-                    "stored"
+                    (String::from("stored"), c.muted)
                 } else {
-                    "session"
+                    (String::from("session"), c.muted)
                 };
                 ListItem::new(vec![
                     Line::from(vec![
                         Span::styled(project.project.clone(), Style::default().fg(c.accent)),
                         Span::raw("  "),
-                        Span::styled(state, Style::default().fg(c.muted)),
+                        Span::styled(state, Style::default().fg(color)),
                     ]),
                     Line::from(Span::styled(
                         project.project_url.clone(),
@@ -1103,6 +1088,9 @@ fn draw_loading(frame: &mut Frame, area: Rect, app: &App) {
     let c = colors(app.theme.palette());
     let popup = centered_rect(34, 16, area);
     let message = app.loading_message().unwrap_or("Loading GitLab data");
+    let detail = app
+        .loading_progress_label()
+        .unwrap_or_else(|| String::from("Please wait..."));
     let text = Text::from(vec![
         Line::default(),
         Line::from(vec![
@@ -1117,7 +1105,7 @@ fn draw_loading(frame: &mut Frame, area: Rect, app: &App) {
             ),
         ]),
         Line::default(),
-        Line::from(Span::styled("Please wait...", Style::default().fg(c.muted))),
+        Line::from(Span::styled(detail, Style::default().fg(c.muted))),
     ]);
 
     frame.render_widget(Clear, popup);
@@ -1181,13 +1169,6 @@ fn issue_text(app: &App, include_actions: bool) -> Text<'static> {
             Line::from(vec![
                 Span::styled("State  ", Style::default().fg(c.muted)),
                 Span::styled(issue.state.clone(), Style::default().fg(c.text)),
-                Span::raw("    "),
-                Span::styled("Status  ", Style::default().fg(c.muted)),
-                Span::styled(
-                    app.issue_status(issue)
-                        .unwrap_or_else(|| String::from("status::none")),
-                    Style::default().fg(c.text),
-                ),
             ]),
             Line::from(vec![
                 Span::styled("Due    ", Style::default().fg(c.muted)),
@@ -1226,7 +1207,7 @@ fn issue_text(app: &App, include_actions: bool) -> Text<'static> {
             lines.push(Line::from(vec![
                 Span::styled("Actions ", Style::default().fg(c.muted)),
                 Span::styled(
-                    "e edit  c comment  a labels  b add blocker  B remove blocker  S status  d due  x close/reopen  H/L move  D delete",
+                    "e edit  c comment  a labels  b add blocker  B remove blocker  d due  x close/reopen  D delete",
                     Style::default().fg(c.text),
                 ),
             ]));
@@ -1238,7 +1219,12 @@ fn issue_text(app: &App, include_actions: bool) -> Text<'static> {
             Style::default().fg(c.iris).add_modifier(Modifier::BOLD),
         )));
         let blockers = app.selected_blockers();
-        if blockers.is_empty() {
+        if !app.selected_issue_links_loaded() {
+            lines.push(Line::from(Span::styled(
+                "Blockers are loading...",
+                Style::default().fg(c.muted),
+            )));
+        } else if blockers.is_empty() {
             lines.push(Line::from(Span::styled(
                 "No blockers.",
                 Style::default().fg(c.muted),

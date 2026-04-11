@@ -1,24 +1,22 @@
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeSet, HashMap, HashSet};
+use std::future::Future;
 use std::sync::mpsc::{self, Receiver, TryRecvError};
-use std::thread;
 
 use anyhow::{Result, anyhow};
 use chrono::{Datelike, Duration, Local, NaiveDate};
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui_themes::Theme;
 
+use crate::background::{
+    AsyncGitLabClient, BackgroundEvent, ProjectLoadRequest, RefreshPayload, spawn_async_result,
+    spawn_issue_links_load, spawn_notes_load, spawn_project_load, spawn_startup_preload,
+};
 use crate::config::{AppConfig, BootstrapConfig, ConfigStore, StartupProject};
 use crate::editor::TextBuffer;
-use crate::gitlab::{GitLabClient, IssueDraft, IssueUpdate, StateEvent};
+use crate::gitlab::{IssueDraft, IssueUpdate, StateEvent};
 use crate::model::{Issue, IssueLink, Note};
 
 const SPINNER_FRAMES: &[&str] = &["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
-const DEFAULT_STATUS_LABELS: &[&str] = &[
-    "status::todo",
-    "status::doing",
-    "status::blocked",
-    "status::done",
-];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Mode {
@@ -55,15 +53,12 @@ pub enum StateFilter {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SelectorKind {
     LabelFilter,
-    StatusFilter,
-    StatusEditor,
 }
 
 #[derive(Debug, Clone)]
 pub struct Filters {
     pub state: StateFilter,
     pub label: Option<String>,
-    pub status: Option<String>,
     pub search: String,
 }
 
@@ -176,7 +171,6 @@ pub struct ProjectMeta {
 struct ProjectSession {
     config: AppConfig,
     theme: Theme,
-    client: GitLabClient,
     issues: Vec<Issue>,
     labels: Vec<String>,
     notes_cache: HashMap<u64, Vec<Note>>,
@@ -190,46 +184,69 @@ struct ProjectSession {
     comment_editor: Option<CommentEditorState>,
 }
 
-struct RefreshPayload {
-    issues: Vec<Issue>,
-    labels: Vec<String>,
-    notes_cache: HashMap<u64, Vec<Note>>,
-    issue_links_cache: HashMap<u64, Vec<IssueLink>>,
+#[derive(Debug, Clone)]
+struct ProjectLoadState {
+    generation: u64,
+    message: String,
+    loaded: usize,
+    total: Option<usize>,
+    foreground: bool,
+    selected_iid: Option<u64>,
 }
 
 struct LoadingState {
-    message: String,
     spinner_frame: usize,
-    selected_iid: Option<u64>,
-    receiver: Receiver<Result<RefreshPayload, String>>,
 }
 
 enum PendingActionState {
     IssueSave {
         draft: IssueEditorState,
         return_mode: Mode,
-        receiver: Receiver<Result<Issue, String>>,
+        receiver: Receiver<Result<PendingActionResult, String>>,
     },
     CommentAdd {
         draft: CommentEditorState,
         return_mode: Mode,
-        receiver: Receiver<Result<(u64, Note), String>>,
+        receiver: Receiver<Result<PendingActionResult, String>>,
+    },
+    Background {
+        receiver: Receiver<Result<PendingActionResult, String>>,
     },
 }
 
 enum PendingActionResult {
     IssueSaved(Issue),
-    CommentAdded { iid: u64, note: Note },
+    CommentAdded {
+        iid: u64,
+        note: Note,
+    },
+    IssueUpdated {
+        issue: Issue,
+        message: String,
+    },
+    IssueDeleted {
+        iid: u64,
+        message: String,
+    },
+    IssueLinksUpdated {
+        iid: u64,
+        links: Vec<IssueLink>,
+        message: String,
+    },
 }
 
 pub struct App {
     pub store: ConfigStore,
     pub config: AppConfig,
     pub theme: Theme,
-    client: GitLabClient,
     pub current_project_url: String,
     pub projects: Vec<ProjectMeta>,
     inactive_sessions: HashMap<String, ProjectSession>,
+    project_loads: HashMap<String, ProjectLoadState>,
+    background_sender: mpsc::Sender<BackgroundEvent>,
+    background_receiver: Receiver<BackgroundEvent>,
+    loading_notes: HashSet<(String, u64)>,
+    loading_issue_links: HashSet<(String, u64)>,
     pub issues: Vec<Issue>,
     pub labels: Vec<String>,
     pub notes_cache: HashMap<u64, Vec<Note>>,
@@ -259,6 +276,7 @@ pub struct App {
     pub store_project_prompt: Option<StoreProjectPromptState>,
     return_mode: Mode,
     pending_g: bool,
+    next_load_generation: u64,
     loading: Option<LoadingState>,
     pending_action: Option<PendingActionState>,
 }
@@ -295,15 +313,19 @@ impl App {
         };
 
         let theme_name = config.theme;
-        let client = GitLabClient::new(&config)?;
+        let (background_sender, background_receiver) = mpsc::channel();
         let mut app = Self {
             store: bootstrap.store.clone(),
             config,
             theme: Theme::new(theme_name),
-            client,
             current_project_url,
             projects: project_metas_from_store(&bootstrap.store),
             inactive_sessions: HashMap::new(),
+            project_loads: HashMap::new(),
+            background_sender,
+            background_receiver,
+            loading_notes: HashSet::new(),
+            loading_issue_links: HashSet::new(),
             issues: Vec::new(),
             labels: Vec::new(),
             notes_cache: HashMap::new(),
@@ -311,7 +333,6 @@ impl App {
             filters: Filters {
                 state: StateFilter::Open,
                 label: None,
-                status: None,
                 search: String::new(),
             },
             selected: 0,
@@ -338,6 +359,7 @@ impl App {
             store_project_prompt: None,
             return_mode: Mode::Normal,
             pending_g: false,
+            next_load_generation: 1,
             loading: None,
             pending_action: None,
         };
@@ -359,7 +381,7 @@ impl App {
 
         match bootstrap.startup {
             StartupProject::Direct { .. } => {
-                app.begin_refresh("Loading GitLab data");
+                app.begin_startup_preload("Loading GitLab data");
                 if prompt_store {
                     app.store_project_prompt = Some(StoreProjectPromptState {
                         project_url: app.current_project_url.clone(),
@@ -368,7 +390,7 @@ impl App {
                 }
             }
             StartupProject::Stored { .. } => {
-                app.begin_refresh("Loading GitLab data");
+                app.begin_startup_preload("Loading GitLab data");
             }
         }
 
@@ -376,90 +398,152 @@ impl App {
     }
 
     pub fn begin_refresh(&mut self, message: &str) {
-        if self.loading.is_some() {
+        let project_url = self.current_project_url.clone();
+        if self.project_is_loading(&project_url) {
+            return;
+        }
+        let selected_iid = self.selected_issue().map(|issue| issue.iid);
+        self.start_project_load(&project_url, message, true, selected_iid);
+    }
+
+    fn begin_startup_preload(&mut self, message: &str) {
+        if self.projects.is_empty() {
             return;
         }
 
-        let client = self.client.clone();
-        let selected_iid = self.selected_issue().map(|issue| issue.iid);
-        let (sender, receiver) = mpsc::channel();
-        let loading_message = message.to_string();
+        let mut requests = Vec::new();
+        let current_project_url = self.current_project_url.clone();
 
-        thread::spawn(move || {
-            let result = (|| -> Result<RefreshPayload> {
-                let mut issues = client.list_issues()?;
-                issues.sort_by_key(|issue| issue.iid);
-                let labels = client.list_labels()?;
-                let mut notes_cache = HashMap::new();
-                let mut issue_links_cache = HashMap::new();
-                for issue in &issues {
-                    let notes = client.list_notes(issue.iid)?;
-                    notes_cache.insert(issue.iid, notes);
-                    let links = client.list_issue_links(issue.iid)?;
-                    issue_links_cache.insert(issue.iid, links);
-                }
-                Ok(RefreshPayload {
-                    issues,
-                    labels,
-                    notes_cache,
-                    issue_links_cache,
-                })
-            })()
-            .map_err(|error| format!("{error:#}"));
+        if let Some(meta) = self
+            .projects
+            .iter()
+            .find(|project| project.project_url == current_project_url)
+            .cloned()
+        {
+            let generation = self.reserve_load_generation();
+            self.project_loads.insert(
+                meta.project_url.clone(),
+                ProjectLoadState {
+                    generation,
+                    message: message.to_string(),
+                    loaded: 0,
+                    total: None,
+                    foreground: true,
+                    selected_iid: None,
+                },
+            );
+            self.loading = Some(LoadingState { spinner_frame: 0 });
+            self.status_line = message.to_string();
+            if let Some(config) = self.project_config(&meta.project_url) {
+                requests.push(ProjectLoadRequest { config, generation });
+            }
+        }
 
-            let _ = sender.send(result);
-        });
+        let startup_projects = self
+            .projects
+            .iter()
+            .filter(|project| project.project_url != current_project_url)
+            .cloned()
+            .collect::<Vec<_>>();
 
-        self.loading = Some(LoadingState {
-            message: loading_message.clone(),
-            spinner_frame: 0,
-            selected_iid,
-            receiver,
-        });
-        self.status_line = loading_message;
+        for meta in startup_projects {
+            let Some(config) = self.project_config(&meta.project_url) else {
+                continue;
+            };
+            let generation = self.reserve_load_generation();
+            self.project_loads.insert(
+                meta.project_url.clone(),
+                ProjectLoadState {
+                    generation,
+                    message: format!("Preloading {}", meta.project),
+                    loaded: 0,
+                    total: None,
+                    foreground: false,
+                    selected_iid: None,
+                },
+            );
+            requests.push(ProjectLoadRequest { config, generation });
+        }
+
+        spawn_startup_preload(requests, self.background_sender.clone());
+    }
+
+    fn start_project_load(
+        &mut self,
+        project_url: &str,
+        message: &str,
+        foreground: bool,
+        selected_iid: Option<u64>,
+    ) {
+        let Some(config) = self.project_config(project_url) else {
+            self.show_error(format!("missing credentials for project {project_url}"));
+            return;
+        };
+        let generation = self.reserve_load_generation();
+        self.project_loads.insert(
+            project_url.to_string(),
+            ProjectLoadState {
+                generation,
+                message: message.to_string(),
+                loaded: 0,
+                total: None,
+                foreground,
+                selected_iid,
+            },
+        );
+
+        if foreground {
+            self.loading = Some(LoadingState { spinner_frame: 0 });
+            self.status_line = message.to_string();
+        }
+
+        spawn_project_load(
+            ProjectLoadRequest { config, generation },
+            self.background_sender.clone(),
+        );
+    }
+
+    fn reserve_load_generation(&mut self) -> u64 {
+        let generation = self.next_load_generation;
+        self.next_load_generation += 1;
+        generation
     }
 
     pub fn tick(&mut self) {
-        let result = if let Some(loading) = self.loading.as_mut() {
+        if let Some(loading) = self.loading.as_mut() {
             loading.spinner_frame = (loading.spinner_frame + 1) % SPINNER_FRAMES.len();
-            match loading.receiver.try_recv() {
-                Ok(result) => Some(result),
-                Err(TryRecvError::Disconnected) => {
-                    Some(Err(String::from("refresh worker disconnected")))
-                }
-                Err(TryRecvError::Empty) => None,
-            }
-        } else {
-            None
-        };
+        }
 
-        if let Some(result) = result {
-            let loading = self.loading.take();
-            match result {
-                Ok(payload) => {
-                    self.apply_refresh_payload(
-                        payload,
-                        loading.and_then(|state| state.selected_iid),
-                    );
+        loop {
+            match self.background_receiver.try_recv() {
+                Ok(event) => self.handle_background_event(event),
+                Err(TryRecvError::Empty) => break,
+                Err(TryRecvError::Disconnected) => {
+                    self.show_error("background loader disconnected");
+                    break;
                 }
-                Err(error) => self.show_error(format!("refresh failed: {error}")),
             }
         }
 
         let pending_result = match self.pending_action.as_mut() {
             Some(PendingActionState::IssueSave { receiver, .. }) => match receiver.try_recv() {
-                Ok(result) => Some(result.map(PendingActionResult::IssueSaved)),
+                Ok(result) => Some(result),
                 Err(TryRecvError::Disconnected) => {
                     Some(Err(String::from("issue save worker disconnected")))
                 }
                 Err(TryRecvError::Empty) => None,
             },
             Some(PendingActionState::CommentAdd { receiver, .. }) => match receiver.try_recv() {
-                Ok(result) => {
-                    Some(result.map(|(iid, note)| PendingActionResult::CommentAdded { iid, note }))
-                }
+                Ok(result) => Some(result),
                 Err(TryRecvError::Disconnected) => {
                     Some(Err(String::from("comment worker disconnected")))
+                }
+                Err(TryRecvError::Empty) => None,
+            },
+            Some(PendingActionState::Background { receiver }) => match receiver.try_recv() {
+                Ok(result) => Some(result),
+                Err(TryRecvError::Disconnected) => {
+                    Some(Err(String::from("background action worker disconnected")))
                 }
                 Err(TryRecvError::Empty) => None,
             },
@@ -475,13 +559,20 @@ impl App {
     }
 
     pub fn is_loading(&self) -> bool {
-        self.loading.is_some()
+        self.loading.is_some() && self.project_is_loading(&self.current_project_url)
     }
 
     pub fn loading_message(&self) -> Option<&str> {
-        self.loading
-            .as_ref()
-            .map(|loading| loading.message.as_str())
+        self.project_loads
+            .get(&self.current_project_url)
+            .map(|state| state.message.as_str())
+    }
+
+    pub fn loading_progress_label(&self) -> Option<String> {
+        let state = self.project_loads.get(&self.current_project_url)?;
+        state
+            .total
+            .map(|total| format!("{}/{} issues", state.loaded, total))
     }
 
     pub fn spinner_frame(&self) -> &'static str {
@@ -519,6 +610,35 @@ impl App {
         self.current_project_url == project_url || self.inactive_sessions.contains_key(project_url)
     }
 
+    pub fn project_load_label(&self, project_url: &str) -> Option<String> {
+        let state = self.project_loads.get(project_url)?;
+        let label = match state.total {
+            Some(total) => format!("loading {}/{}", state.loaded, total),
+            None => String::from("loading"),
+        };
+        Some(label)
+    }
+
+    fn project_is_loading(&self, project_url: &str) -> bool {
+        self.project_loads.contains_key(project_url)
+    }
+
+    fn project_config(&self, project_url: &str) -> Option<AppConfig> {
+        let project = self
+            .projects
+            .iter()
+            .find(|project| project.project_url == project_url)?;
+        let private_token = project.private_token.clone()?;
+        Some(AppConfig {
+            project_url: project.project_url.clone(),
+            gitlab_url: project.gitlab_url.clone(),
+            project: project.project.clone(),
+            private_token,
+            theme: project.theme,
+            stored: project.stored,
+        })
+    }
+
     pub fn show_warning(&mut self, message: impl Into<String>) {
         let message = message.into();
         self.status_line = first_line(&message);
@@ -535,6 +655,25 @@ impl App {
             title: error_title(&message),
             message,
         });
+    }
+
+    fn begin_background_action<F>(&mut self, status_line: impl Into<String>, future: F)
+    where
+        F: Future<Output = Result<PendingActionResult>> + Send + 'static,
+    {
+        let (sender, receiver) = mpsc::channel();
+        spawn_async_result(sender, future);
+        self.pending_action = Some(PendingActionState::Background { receiver });
+        self.status_line = status_line.into();
+    }
+
+    fn has_pending_action_guard(&mut self) -> bool {
+        if self.pending_action.is_some() {
+            self.status_line = String::from("wait for the current background action to finish");
+            true
+        } else {
+            false
+        }
     }
 
     pub fn on_key(&mut self, key: KeyEvent) -> Result<()> {
@@ -613,6 +752,12 @@ impl App {
             .unwrap_or_default()
     }
 
+    pub fn selected_issue_links_loaded(&self) -> bool {
+        self.selected_issue()
+            .map(|issue| self.issue_links_cache.contains_key(&issue.iid))
+            .unwrap_or(true)
+    }
+
     pub fn visible_issue_indices(&self) -> Vec<usize> {
         self.issues
             .iter()
@@ -653,35 +798,8 @@ impl App {
         }
     }
 
-    pub fn issue_status(&self, issue: &Issue) -> Option<String> {
-        issue
-            .labels
-            .iter()
-            .find(|label| label.starts_with("status::"))
-            .cloned()
-    }
-
-    pub fn available_statuses(&self) -> Vec<String> {
-        let mut statuses = DEFAULT_STATUS_LABELS
-            .iter()
-            .map(|label| (*label).to_string())
-            .collect::<Vec<_>>();
-        for label in &self.labels {
-            if label.starts_with("status::") && !statuses.contains(label) {
-                statuses.push(label.clone());
-            }
-        }
-        statuses.sort();
-        statuses
-    }
-
     pub fn project_label_options(&self) -> Vec<String> {
-        let mut labels = self
-            .labels
-            .iter()
-            .filter(|label| !label.starts_with("status::"))
-            .cloned()
-            .collect::<Vec<_>>();
+        let mut labels = self.labels.clone();
         labels.sort();
         labels
     }
@@ -788,10 +906,6 @@ impl App {
                 self.pending_g = false;
                 self.open_label_editor();
             }
-            KeyCode::Char('S') => {
-                self.pending_g = false;
-                self.open_status_editor();
-            }
             KeyCode::Char('d') => {
                 self.pending_g = false;
                 self.open_due_date_picker();
@@ -807,10 +921,6 @@ impl App {
             KeyCode::Char('F') | KeyCode::Char('l') => {
                 self.pending_g = false;
                 self.open_label_filter();
-            }
-            KeyCode::Char('s') => {
-                self.pending_g = false;
-                self.open_status_filter();
             }
             _ => self.handle_list_key(key)?,
         }
@@ -901,10 +1011,6 @@ impl App {
                 self.pending_g = false;
                 self.open_label_editor();
             }
-            KeyCode::Char('S') => {
-                self.pending_g = false;
-                self.open_status_editor();
-            }
             KeyCode::Char('d') => {
                 self.pending_g = false;
                 self.open_due_date_picker();
@@ -937,14 +1043,6 @@ impl App {
             KeyCode::Char(']') => {
                 self.pending_g = false;
                 self.cycle_project(1)?;
-            }
-            KeyCode::Char('H') => {
-                self.pending_g = false;
-                self.move_selected_issue_status(-1)?;
-            }
-            KeyCode::Char('L') => {
-                self.pending_g = false;
-                self.move_selected_issue_status(1)?;
             }
             KeyCode::Char('?') => {
                 self.pending_g = false;
@@ -1424,20 +1522,12 @@ impl App {
             "reopen" => self.reopen_selected_issue()?,
             "comment" => self.open_comment_editor(),
             "labels" => self.open_label_editor(),
-            "status" => self.open_status_editor(),
             "due" => self.open_due_date_picker(),
             "filter open" => self.set_state_filter(StateFilter::Open)?,
             "filter closed" => self.set_state_filter(StateFilter::Closed)?,
             "filter all" => self.set_state_filter(StateFilter::All)?,
             "filter label clear" => {
                 self.filters.label = None;
-                self.selected = 0;
-                self.clamp_selection();
-                self.ensure_selected_notes_loaded()?;
-                self.ensure_selected_issue_links_loaded()?;
-            }
-            "filter status clear" => {
-                self.filters.status = None;
                 self.selected = 0;
                 self.clamp_selection();
                 self.ensure_selected_notes_loaded()?;
@@ -1687,6 +1777,7 @@ impl App {
         self.restore_session(session);
         self.current_project_url = project_url.to_string();
         self.mode = Mode::Normal;
+        self.loading = None;
         self.store.set_last_project(project_url)?;
         Ok(())
     }
@@ -1694,31 +1785,45 @@ impl App {
     fn activate_new_project(&mut self, meta: ProjectMeta) -> Result<()> {
         self.stash_current_session();
 
-        let private_token = meta
-            .private_token
-            .clone()
+        let config = self
+            .project_config(&meta.project_url)
             .ok_or_else(|| anyhow!("stored project is missing a private token"))?;
-
-        self.config = AppConfig {
-            project_url: meta.project_url.clone(),
-            gitlab_url: meta.gitlab_url.clone(),
-            project: meta.project.clone(),
-            private_token,
-            theme: meta.theme,
-            stored: meta.stored,
-        };
-        self.client = GitLabClient::new(&self.config)?;
-        self.theme = Theme::new(meta.theme);
-        self.current_project_url = meta.project_url.clone();
-        self.clear_active_project_state();
+        self.set_active_project_context(config, meta.theme)?;
         self.mode = Mode::Normal;
         self.store.set_last_project(&meta.project_url)?;
-        self.begin_refresh(&format!("Loading {}", self.config.project));
+
+        if !self.project_is_loading(&meta.project_url) {
+            self.start_project_load(
+                &meta.project_url,
+                &format!("Loading {}", meta.project),
+                true,
+                None,
+            );
+        } else if let Some(state) = self.project_loads.get_mut(&meta.project_url) {
+            state.foreground = true;
+            state.message = format!("Loading {}", meta.project);
+            self.loading = Some(LoadingState { spinner_frame: 0 });
+            self.status_line = state.message.clone();
+        }
+
+        Ok(())
+    }
+
+    fn set_active_project_context(
+        &mut self,
+        config: AppConfig,
+        theme_name: ratatui_themes::ThemeName,
+    ) -> Result<()> {
+        self.config = config;
+        self.theme = Theme::new(theme_name);
+        self.current_project_url = self.config.project_url.clone();
+        self.clear_active_project_state();
         Ok(())
     }
 
     fn stash_current_session(&mut self) {
-        if self.current_project_url.is_empty() {
+        if self.current_project_url.is_empty() || self.project_is_loading(&self.current_project_url)
+        {
             return;
         }
 
@@ -1727,7 +1832,6 @@ impl App {
             ProjectSession {
                 config: self.config.clone(),
                 theme: self.theme.clone(),
-                client: self.client.clone(),
                 issues: self.issues.clone(),
                 labels: self.labels.clone(),
                 notes_cache: self.notes_cache.clone(),
@@ -1746,7 +1850,6 @@ impl App {
     fn restore_session(&mut self, session: ProjectSession) {
         self.config = session.config;
         self.theme = session.theme;
-        self.client = session.client;
         self.issues = session.issues;
         self.labels = session.labels;
         self.notes_cache = session.notes_cache;
@@ -1772,6 +1875,8 @@ impl App {
         self.pending_g = false;
         self.loading = None;
         self.pending_action = None;
+        self.loading_notes.clear();
+        self.loading_issue_links.clear();
     }
 
     fn clear_active_project_state(&mut self) {
@@ -1782,7 +1887,6 @@ impl App {
         self.filters = Filters {
             state: StateFilter::Open,
             label: None,
-            status: None,
             search: String::new(),
         };
         self.selected = 0;
@@ -1806,7 +1910,8 @@ impl App {
         self.store_project_prompt = None;
         self.return_mode = Mode::Normal;
         self.pending_g = false;
-        self.loading = None;
+        self.loading_notes.clear();
+        self.loading_issue_links.clear();
         self.pending_action = None;
     }
 
@@ -1910,6 +2015,10 @@ impl App {
     }
 
     fn apply_blocker_picker(&mut self) -> Result<()> {
+        if self.has_pending_action_guard() {
+            return Ok(());
+        }
+
         let Some(candidate) = self.current_blocker_candidate() else {
             self.blocker_picker = None;
             self.restore_return_mode();
@@ -1927,24 +2036,41 @@ impl App {
             .map(|picker| picker.action)
             .unwrap_or(BlockerAction::Add);
 
-        match action {
-            BlockerAction::Add => {
-                self.client.add_blocker(issue_iid, candidate.iid)?;
-                self.refresh_issue_links(issue_iid)?;
-                self.status_line = format!("added blocker #{}", candidate.iid);
-            }
-            BlockerAction::Remove => {
-                let link_id = candidate
-                    .issue_link_id
-                    .ok_or_else(|| anyhow!("missing blocker link id"))?;
-                self.client.delete_issue_link(issue_iid, link_id)?;
-                self.refresh_issue_links(issue_iid)?;
-                self.status_line = format!("removed blocker #{}", candidate.iid);
-            }
-        }
-
         self.blocker_picker = None;
         self.restore_return_mode();
+
+        let config = self.config.clone();
+        let status_line = match action {
+            BlockerAction::Add => format!("adding blocker #{} in background", candidate.iid),
+            BlockerAction::Remove => {
+                format!("removing blocker #{} in background", candidate.iid)
+            }
+        };
+
+        self.begin_background_action(status_line, async move {
+            let client = AsyncGitLabClient::new(&config)?;
+            let message = match action {
+                BlockerAction::Add => {
+                    client.add_blocker(issue_iid, candidate.iid).await?;
+                    format!("added blocker #{}", candidate.iid)
+                }
+                BlockerAction::Remove => {
+                    let link_id = candidate
+                        .issue_link_id
+                        .ok_or_else(|| anyhow!("missing blocker link id"))?;
+                    client.delete_issue_link(issue_iid, link_id).await?;
+                    format!("removed blocker #{}", candidate.iid)
+                }
+            };
+
+            let links = client.list_issue_links(issue_iid).await?;
+            Ok(PendingActionResult::IssueLinksUpdated {
+                iid: issue_iid,
+                links,
+                message,
+            })
+        });
+
         Ok(())
     }
 
@@ -1980,17 +2106,30 @@ impl App {
     }
 
     fn confirm_delete_issue(&mut self) -> Result<()> {
+        if self.has_pending_action_guard() {
+            return Ok(());
+        }
+
         let Some(confirm) = self.delete_confirmation.clone() else {
             self.restore_return_mode();
             return Ok(());
         };
 
-        self.client.delete_issue(confirm.iid)?;
         self.delete_confirmation = None;
-        self.remove_issue(confirm.iid);
         self.mode = Mode::Normal;
         self.return_mode = Mode::Normal;
-        self.status_line = format!("deleted #{}", confirm.iid);
+
+        let config = self.config.clone();
+        let iid = confirm.iid;
+        self.begin_background_action(format!("deleting #{} in background", iid), async move {
+            let client = AsyncGitLabClient::new(&config)?;
+            client.delete_issue(iid).await?;
+            Ok(PendingActionResult::IssueDeleted {
+                iid,
+                message: format!("deleted #{}", iid),
+            })
+        });
+
         Ok(())
     }
 
@@ -2018,53 +2157,6 @@ impl App {
             .saturating_sub(self.issue_view_view_height)
     }
 
-    fn move_selected_issue_status(&mut self, direction: isize) -> Result<()> {
-        let statuses = self.available_statuses();
-        let issue = self
-            .selected_issue()
-            .cloned()
-            .ok_or_else(|| anyhow!("no issue selected"))?;
-        let current = self
-            .issue_status(&issue)
-            .unwrap_or_else(|| self.default_status());
-        let current_index = statuses
-            .iter()
-            .position(|status| status == &current)
-            .unwrap_or(0);
-        let next_index = (current_index as isize + direction)
-            .clamp(0, (statuses.len().saturating_sub(1)) as isize)
-            as usize;
-
-        if next_index == current_index {
-            return Ok(());
-        }
-
-        let next_status = statuses[next_index].clone();
-        let mut labels = issue
-            .labels
-            .iter()
-            .filter(|label| !label.starts_with("status::"))
-            .cloned()
-            .collect::<Vec<_>>();
-        labels.push(next_status.clone());
-
-        let updated = self.client.update_issue(
-            issue.iid,
-            &IssueUpdate {
-                labels: Some(labels),
-                ..IssueUpdate::default()
-            },
-        )?;
-
-        self.replace_issue(updated);
-        self.status_line = format!("moved #{} to {next_status}", issue.iid);
-        Ok(())
-    }
-
-    fn default_status(&self) -> String {
-        String::from(DEFAULT_STATUS_LABELS[0])
-    }
-
     fn toggle_selected_issue_state(&mut self) -> Result<()> {
         if let Some(issue) = self.selected_issue() {
             if issue.state == "opened" {
@@ -2077,36 +2169,64 @@ impl App {
     }
 
     fn close_selected_issue(&mut self) -> Result<()> {
+        if self.has_pending_action_guard() {
+            return Ok(());
+        }
+
         let iid = self
             .selected_issue()
             .map(|issue| issue.iid)
             .ok_or_else(|| anyhow!("no issue selected"))?;
-        let issue = self.client.update_issue(
-            iid,
-            &IssueUpdate {
-                state_event: Some(StateEvent::Close),
-                ..IssueUpdate::default()
-            },
-        )?;
-        self.replace_issue(issue);
-        self.status_line = format!("closed #{iid}");
+
+        let config = self.config.clone();
+        self.begin_background_action(format!("closing #{} in background", iid), async move {
+            let client = AsyncGitLabClient::new(&config)?;
+            let issue = client
+                .update_issue(
+                    iid,
+                    &IssueUpdate {
+                        state_event: Some(StateEvent::Close),
+                        ..IssueUpdate::default()
+                    },
+                )
+                .await?;
+            Ok(PendingActionResult::IssueUpdated {
+                issue,
+                message: format!("closed #{}", iid),
+            })
+        });
+
         Ok(())
     }
 
     fn reopen_selected_issue(&mut self) -> Result<()> {
+        if self.has_pending_action_guard() {
+            return Ok(());
+        }
+
         let iid = self
             .selected_issue()
             .map(|issue| issue.iid)
             .ok_or_else(|| anyhow!("no issue selected"))?;
-        let issue = self.client.update_issue(
-            iid,
-            &IssueUpdate {
-                state_event: Some(StateEvent::Reopen),
-                ..IssueUpdate::default()
-            },
-        )?;
-        self.replace_issue(issue);
-        self.status_line = format!("reopened #{iid}");
+
+        let config = self.config.clone();
+        self.begin_background_action(format!("reopening #{} in background", iid), async move {
+            let client = AsyncGitLabClient::new(&config)?;
+            let issue = client
+                .update_issue(
+                    iid,
+                    &IssueUpdate {
+                        state_event: Some(StateEvent::Reopen),
+                        ..IssueUpdate::default()
+                    },
+                )
+                .await?;
+            Ok(PendingActionResult::IssueUpdated {
+                issue,
+                message: format!("reopened #{}", iid),
+            })
+        });
+
         Ok(())
     }
 
@@ -2114,9 +2234,10 @@ impl App {
         let Some(iid) = self.selected_issue().map(|issue| issue.iid) else {
             return Ok(());
         };
-        if !self.notes_cache.contains_key(&iid) {
-            let notes = self.client.list_notes(iid)?;
-            self.notes_cache.insert(iid, notes);
+        let key = (self.current_project_url.clone(), iid);
+        if !self.notes_cache.contains_key(&iid) && !self.loading_notes.contains(&key) {
+            self.loading_notes.insert(key);
+            spawn_notes_load(self.config.clone(), iid, self.background_sender.clone());
         }
         Ok(())
     }
@@ -2125,16 +2246,11 @@ impl App {
         let Some(iid) = self.selected_issue().map(|issue| issue.iid) else {
             return Ok(());
         };
-        if !self.issue_links_cache.contains_key(&iid) {
-            let links = self.client.list_issue_links(iid)?;
-            self.issue_links_cache.insert(iid, links);
+        let key = (self.current_project_url.clone(), iid);
+        if !self.issue_links_cache.contains_key(&iid) && !self.loading_issue_links.contains(&key) {
+            self.loading_issue_links.insert(key);
+            spawn_issue_links_load(self.config.clone(), iid, self.background_sender.clone());
         }
-        Ok(())
-    }
-
-    fn refresh_issue_links(&mut self, issue_iid: u64) -> Result<()> {
-        let links = self.client.list_issue_links(issue_iid)?;
-        self.issue_links_cache.insert(issue_iid, links);
         Ok(())
     }
 
@@ -2209,7 +2325,7 @@ impl App {
             editor.body = TextBuffer::from_text(&description);
         }
 
-        let client = self.client.clone();
+        let config = self.config.clone();
         let editor_snapshot = editor.clone();
         let return_mode = self.return_mode;
         let (sender, receiver) = mpsc::channel();
@@ -2218,28 +2334,33 @@ impl App {
             None => String::from("creating issue in background"),
         };
 
-        thread::spawn(move || {
-            let result = (|| -> Result<Issue> {
-                match editor_snapshot.editing_iid {
-                    Some(iid) => client.update_issue(
-                        iid,
-                        &IssueUpdate {
-                            title: Some(title),
-                            description: Some(description),
-                            ..IssueUpdate::default()
-                        },
-                    ),
-                    None => client.create_issue(&IssueDraft {
-                        title,
-                        description,
-                        labels: vec![String::from(DEFAULT_STATUS_LABELS[0])],
-                        due_date: None,
-                    }),
+        spawn_async_result(sender, async move {
+            let client = AsyncGitLabClient::new(&config)?;
+            let issue = match editor_snapshot.editing_iid {
+                Some(iid) => {
+                    client
+                        .update_issue(
+                            iid,
+                            &IssueUpdate {
+                                title: Some(title),
+                                description: Some(description),
+                                ..IssueUpdate::default()
+                            },
+                        )
+                        .await?
                 }
-            })()
-            .map_err(|error| format!("{error:#}"));
-
-            let _ = sender.send(result);
+                None => {
+                    client
+                        .create_issue(&IssueDraft {
+                            title,
+                            description,
+                            labels: Vec::new(),
+                            due_date: None,
+                        })
+                        .await?
+                }
+            };
+            Ok(PendingActionResult::IssueSaved(issue))
         });
 
         self.restore_return_mode();
@@ -2302,16 +2423,14 @@ impl App {
             return Ok(());
         }
 
-        let client = self.client.clone();
+        let config = self.config.clone();
         let return_mode = self.return_mode;
         let (sender, receiver) = mpsc::channel();
 
-        thread::spawn(move || {
-            let result = client
-                .add_note(iid, &body)
-                .map(|note| (iid, note))
-                .map_err(|error| format!("{error:#}"));
-            let _ = sender.send(result);
+        spawn_async_result(sender, async move {
+            let client = AsyncGitLabClient::new(&config)?;
+            let note = client.add_note(iid, &body).await?;
+            Ok(PendingActionResult::CommentAdded { iid, note })
         });
 
         self.restore_return_mode();
@@ -2342,6 +2461,10 @@ impl App {
     }
 
     fn save_label_picker(&mut self) -> Result<()> {
+        if self.has_pending_action_guard() {
+            return Ok(());
+        }
+
         let Some(picker) = self.label_picker.take() else {
             return Ok(());
         };
@@ -2351,17 +2474,29 @@ impl App {
             .ok_or_else(|| anyhow!("no issue selected"))?;
         let labels = picker.selected.into_iter().collect::<Vec<_>>();
 
-        let issue = self.client.update_issue(
-            iid,
-            &IssueUpdate {
-                labels: Some(labels),
-                ..IssueUpdate::default()
-            },
-        )?;
-
-        self.replace_issue(issue);
         self.restore_return_mode();
-        self.status_line = format!("labels updated for #{iid}");
+
+        let config = self.config.clone();
+        self.begin_background_action(
+            format!("updating labels for #{} in background", iid),
+            async move {
+                let client = AsyncGitLabClient::new(&config)?;
+                let issue = client
+                    .update_issue(
+                        iid,
+                        &IssueUpdate {
+                            labels: Some(labels),
+                            ..IssueUpdate::default()
+                        },
+                    )
+                    .await?;
+                Ok(PendingActionResult::IssueUpdated {
+                    issue,
+                    message: format!("labels updated for #{}", iid),
+                })
+            },
+        );
+
         Ok(())
     }
 
@@ -2376,40 +2511,6 @@ impl App {
             allow_clear: true,
         });
         self.selector_kind = Some(SelectorKind::LabelFilter);
-        self.mode = Mode::Selector;
-    }
-
-    fn open_status_filter(&mut self) {
-        self.capture_return_mode();
-        self.selector = Some(SelectorState {
-            title: String::from("Filter by Status"),
-            query: String::new(),
-            options: self.available_statuses(),
-            selected: self.filters.status.clone(),
-            cursor: 0,
-            allow_clear: true,
-        });
-        self.selector_kind = Some(SelectorKind::StatusFilter);
-        self.mode = Mode::Selector;
-    }
-
-    fn open_status_editor(&mut self) {
-        let Some(selected_status) = self.selected_issue().map(|issue| {
-            self.issue_status(issue)
-                .unwrap_or_else(|| self.default_status())
-        }) else {
-            return;
-        };
-        self.capture_return_mode();
-        self.selector = Some(SelectorState {
-            title: String::from("Set Issue Status"),
-            query: String::new(),
-            options: self.available_statuses(),
-            selected: Some(selected_status),
-            cursor: 0,
-            allow_clear: true,
-        });
-        self.selector_kind = Some(SelectorKind::StatusEditor);
         self.mode = Mode::Selector;
     }
 
@@ -2440,42 +2541,6 @@ impl App {
                     None => String::from("label filter cleared"),
                 };
             }
-            SelectorKind::StatusFilter => {
-                self.filters.status = choice;
-                self.selected = 0;
-                self.issue_view_scroll = 0;
-                self.clamp_selection();
-                self.ensure_selected_notes_loaded()?;
-                self.ensure_selected_issue_links_loaded()?;
-                self.status_line = match &self.filters.status {
-                    Some(status) => format!("status filter: {status}"),
-                    None => String::from("status filter cleared"),
-                };
-            }
-            SelectorKind::StatusEditor => {
-                let issue = self
-                    .selected_issue()
-                    .cloned()
-                    .ok_or_else(|| anyhow!("no issue selected"))?;
-                let mut labels = issue
-                    .labels
-                    .iter()
-                    .filter(|label| !label.starts_with("status::"))
-                    .cloned()
-                    .collect::<Vec<_>>();
-                if let Some(choice) = choice {
-                    labels.push(choice.clone());
-                }
-                let updated = self.client.update_issue(
-                    issue.iid,
-                    &IssueUpdate {
-                        labels: Some(labels),
-                        ..IssueUpdate::default()
-                    },
-                )?;
-                self.replace_issue(updated);
-                self.status_line = format!("status updated for #{}", issue.iid);
-            }
         }
 
         self.restore_return_mode();
@@ -2498,26 +2563,40 @@ impl App {
     }
 
     fn save_due_date_picker(&mut self, value: Option<NaiveDate>) -> Result<()> {
+        if self.has_pending_action_guard() {
+            return Ok(());
+        }
+
         let iid = self
             .selected_issue()
             .map(|issue| issue.iid)
             .ok_or_else(|| anyhow!("no issue selected"))?;
 
-        let issue = self.client.update_issue(
-            iid,
-            &IssueUpdate {
-                due_date: Some(value.map(|date| date.format("%Y-%m-%d").to_string())),
-                ..IssueUpdate::default()
-            },
-        )?;
-
-        self.replace_issue(issue);
         self.due_date_picker = None;
         self.restore_return_mode();
-        self.status_line = match value {
+
+        let config = self.config.clone();
+        let message = match value {
             Some(date) => format!("due date set to {}", date.format("%Y-%m-%d")),
             None => format!("due date cleared for #{iid}"),
         };
+        self.begin_background_action(
+            format!("saving due date for #{} in background", iid),
+            async move {
+                let client = AsyncGitLabClient::new(&config)?;
+                let issue = client
+                    .update_issue(
+                        iid,
+                        &IssueUpdate {
+                            due_date: Some(value.map(|date| date.format("%Y-%m-%d").to_string())),
+                            ..IssueUpdate::default()
+                        },
+                    )
+                    .await?;
+                Ok(PendingActionResult::IssueUpdated { issue, message })
+            },
+        );
+
         Ok(())
     }
 
@@ -2528,12 +2607,6 @@ impl App {
 
         if let Some(label) = &self.filters.label {
             if !issue.labels.iter().any(|item| item == label) {
-                return false;
-            }
-        }
-
-        if let Some(status) = &self.filters.status {
-            if self.issue_status(issue).as_deref() != Some(status.as_str()) {
                 return false;
             }
         }
@@ -2580,23 +2653,7 @@ impl App {
     }
 
     fn rebuild_label_catalog(&mut self) {
-        for label in DEFAULT_STATUS_LABELS {
-            let label = label.to_string();
-            if !self.labels.contains(&label) {
-                self.labels.push(label);
-            }
-        }
-
-        for issue in &self.issues {
-            for label in &issue.labels {
-                if !self.labels.contains(label) {
-                    self.labels.push(label.clone());
-                }
-            }
-        }
-
-        self.labels.sort();
-        self.labels.dedup();
+        rebuild_label_catalog_for(&self.issues, &mut self.labels);
     }
 
     fn replace_issue(&mut self, issue: Issue) {
@@ -2624,6 +2681,8 @@ impl App {
         self.labels = payload.labels;
         self.notes_cache = payload.notes_cache;
         self.issue_links_cache = payload.issue_links_cache;
+        self.loading_notes.clear();
+        self.loading_issue_links.clear();
         self.rebuild_label_catalog();
         self.restore_selection(selected_iid);
         self.status_line = format!(
@@ -2631,6 +2690,163 @@ impl App {
             self.issues.len(),
             self.config.project
         );
+    }
+
+    fn handle_background_event(&mut self, event: BackgroundEvent) {
+        match event {
+            BackgroundEvent::ProjectLoadProgress {
+                project_url,
+                generation,
+                loaded,
+                total,
+            } => {
+                if let Some(state) = self.project_loads.get_mut(&project_url) {
+                    if state.generation == generation {
+                        state.loaded = loaded;
+                        state.total = Some(total);
+                    }
+                }
+            }
+            BackgroundEvent::ProjectLoaded {
+                project_url,
+                generation,
+                payload,
+            } => {
+                let Some(state) = self.project_loads.get(&project_url).cloned() else {
+                    return;
+                };
+                if state.generation != generation {
+                    return;
+                }
+
+                self.project_loads.remove(&project_url);
+
+                if self.current_project_url == project_url {
+                    self.apply_refresh_payload(payload, state.selected_iid);
+                } else if let Err(error) = self.store_prefetched_session(&project_url, payload) {
+                    self.show_error(format!("failed to cache {}: {error:#}", project_url));
+                }
+
+                self.sync_loading_overlay();
+            }
+            BackgroundEvent::ProjectLoadFailed {
+                project_url,
+                generation,
+                error,
+            } => {
+                let Some(state) = self.project_loads.get(&project_url).cloned() else {
+                    return;
+                };
+                if state.generation != generation {
+                    return;
+                }
+
+                self.project_loads.remove(&project_url);
+                if self.current_project_url == project_url && state.foreground {
+                    self.sync_loading_overlay();
+                    self.show_error(format!("refresh failed: {error}"));
+                } else {
+                    self.status_line = format!("failed to preload {}", project_url);
+                    self.sync_loading_overlay();
+                }
+            }
+            BackgroundEvent::NotesLoaded {
+                project_url,
+                issue_iid,
+                notes,
+            } => {
+                self.loading_notes.remove(&(project_url.clone(), issue_iid));
+                if self.current_project_url == project_url {
+                    self.notes_cache.insert(issue_iid, notes);
+                } else if let Some(session) = self.inactive_sessions.get_mut(&project_url) {
+                    session.notes_cache.insert(issue_iid, notes);
+                }
+            }
+            BackgroundEvent::NotesLoadFailed {
+                project_url,
+                issue_iid,
+                error,
+            } => {
+                self.loading_notes.remove(&(project_url.clone(), issue_iid));
+                if self.current_project_url == project_url {
+                    self.status_line = format!("failed to load comments for #{}", issue_iid);
+                    self.show_error(format!("comment preload failed: {error}"));
+                }
+            }
+            BackgroundEvent::IssueLinksLoaded {
+                project_url,
+                issue_iid,
+                links,
+            } => {
+                self.loading_issue_links
+                    .remove(&(project_url.clone(), issue_iid));
+                if self.current_project_url == project_url {
+                    self.issue_links_cache.insert(issue_iid, links);
+                } else if let Some(session) = self.inactive_sessions.get_mut(&project_url) {
+                    session.issue_links_cache.insert(issue_iid, links);
+                }
+            }
+            BackgroundEvent::IssueLinksLoadFailed {
+                project_url,
+                issue_iid,
+                error,
+            } => {
+                self.loading_issue_links
+                    .remove(&(project_url.clone(), issue_iid));
+                if self.current_project_url == project_url {
+                    self.status_line = format!("failed to load blockers for #{}", issue_iid);
+                    self.show_error(format!("blocker preload failed: {error}"));
+                }
+            }
+        }
+    }
+
+    fn store_prefetched_session(
+        &mut self,
+        project_url: &str,
+        payload: RefreshPayload,
+    ) -> Result<()> {
+        let config = self
+            .project_config(project_url)
+            .ok_or_else(|| anyhow!("missing project config for {project_url}"))?;
+        let theme = Theme::new(config.theme);
+        let mut labels = payload.labels;
+        rebuild_label_catalog_for(&payload.issues, &mut labels);
+
+        self.inactive_sessions.insert(
+            project_url.to_string(),
+            ProjectSession {
+                config,
+                theme,
+                issues: payload.issues,
+                labels,
+                notes_cache: payload.notes_cache,
+                issue_links_cache: payload.issue_links_cache,
+                filters: Filters {
+                    state: StateFilter::Open,
+                    label: None,
+                    search: String::new(),
+                },
+                selected: 0,
+                issue_view_scroll: 0,
+                issue_view_view_height: 0,
+                issue_view_content_height: 0,
+                issue_editor: None,
+                comment_editor: None,
+            },
+        );
+
+        Ok(())
+    }
+
+    fn sync_loading_overlay(&mut self) {
+        if self.project_is_loading(&self.current_project_url) {
+            if self.loading.is_none() {
+                self.loading = Some(LoadingState { spinner_frame: 0 });
+            }
+        } else {
+            self.loading = None;
+        }
     }
 
     fn finish_pending_action(
@@ -2655,6 +2871,31 @@ impl App {
                 self.status_line = format!("comment added to #{}", iid);
             }
             (
+                PendingActionState::Background { .. },
+                Ok(PendingActionResult::IssueUpdated { issue, message }),
+            ) => {
+                self.replace_issue(issue);
+                self.status_line = message;
+            }
+            (
+                PendingActionState::Background { .. },
+                Ok(PendingActionResult::IssueDeleted { iid, message }),
+            ) => {
+                self.remove_issue(iid);
+                self.status_line = message;
+            }
+            (
+                PendingActionState::Background { .. },
+                Ok(PendingActionResult::IssueLinksUpdated {
+                    iid,
+                    links,
+                    message,
+                }),
+            ) => {
+                self.issue_links_cache.insert(iid, links);
+                self.status_line = message;
+            }
+            (
                 PendingActionState::IssueSave {
                     draft, return_mode, ..
                 },
@@ -2675,6 +2916,9 @@ impl App {
                 self.return_mode = return_mode;
                 self.mode = Mode::CommentEditor;
                 self.show_error(format!("comment save failed: {error}"));
+            }
+            (PendingActionState::Background { .. }, Err(error)) => {
+                self.show_error(format!("background action failed: {error}"));
             }
             _ => {
                 self.show_error("background action finished with an unexpected result");
@@ -2787,6 +3031,19 @@ fn next_field(field: EditorField) -> EditorField {
 
 fn previous_field(field: EditorField) -> EditorField {
     next_field(field)
+}
+
+fn rebuild_label_catalog_for(issues: &[Issue], labels: &mut Vec<String>) {
+    for issue in issues {
+        for label in &issue.labels {
+            if !labels.contains(label) {
+                labels.push(label.clone());
+            }
+        }
+    }
+
+    labels.sort();
+    labels.dedup();
 }
 
 fn matches_state_filter(issue: &Issue, filter: StateFilter) -> bool {

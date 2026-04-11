@@ -7,13 +7,13 @@ It is built around the GitLab REST API and supports:
 - creating issues as todos
 - editing title and markdown body
 - closing and reopening issues
-- workflow status via `status::...` labels
 - label editing with autocomplete
 - comments
 - blockers
 - due date picking
-- filters for state, label, status, and free-text search
+- filters for state, label, and free-text search
 - multiple stored projects with per-project theme memory
+- async background preload for stored projects
 - plain-text private token storage in the local config file
 
 ## Build
@@ -112,11 +112,9 @@ export PATH="$HOME/.local/bin:$PATH"
 - `b`: add a blocker
 - `B`: remove a blocker
 - `a`: edit labels with autocomplete
-- `S`: set issue status label
 - `d`: open due date picker
 - `Tab`: cycle all/open/closed filter
 - `F`: filter by label
-- `s`: filter by status
 - `/`: search
 - `:`: command mode
 - `?`: help
@@ -137,10 +135,9 @@ Inside the editor/comment popups:
 
 ## Notes
 
-- Workflow state is modeled with labels like `status::todo`, `status::doing`, `status::blocked`, and `status::done`.
 - GitLab issue `opened` / `closed` remains the source of truth for lifecycle state.
-- Startup and refresh preload issue comments into memory so opening issue details is immediate after loading completes.
-- The UI uses `ratatui-themes` with Rosé Pine as the default theme, and your last chosen theme is remembered in `~/.config/glissues/config.toml`.
-- Stored project private tokens are saved in plain text in `~/.config/glissues/config.toml`.
-- Project data is only fetched when you actually open that project in the current session.
-- New stored projects inherit the current theme, and each stored project remembers its own theme.
+ - Startup preloads all known projects in the background, and each project preload includes issues, comments, and blocker links.
+ - Active-project refreshes and edits run in the background so the TUI stays responsive during GitLab requests.
+ - The UI uses `ratatui-themes` with Rosé Pine as the default theme, and your last chosen theme is remembered in `~/.config/glissues/config.toml`.
+ - Stored project private tokens are saved in plain text in `~/.config/glissues/config.toml`.
+ - New stored projects inherit the current theme, and each stored project remembers its own theme.

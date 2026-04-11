@@ -14,10 +14,10 @@ It captures the repository-specific commands, expectations, and coding style.
 ## Project Summary
 
 - `glissues` is a Rust TUI for managing GitLab issues as todo items.
-- It uses the GitLab REST API with blocking `reqwest` calls.
+- It uses background async HTTP loading for prefetch and UI-triggered mutations.
 - The main UI is a list + preview layout with popup overlays.
 - Theme support is implemented through `ratatui-themes`.
-- Startup and refresh preload comments and blocker links into memory for the active project only.
+- Startup preloads full data for all known projects, including comments and blocker links.
 - Config lives in `~/.config/glissues/config.toml` and stores multi-project metadata.
 - Stored GitLab private tokens are saved in plain text in the local config file.
 
@@ -25,6 +25,7 @@ It captures the repository-specific commands, expectations, and coding style.
 
 - `src/main.rs` - terminal setup and event loop.
 - `src/app.rs` - application state and input handling.
+- `src/background.rs` - async project preloading and background GitLab tasks.
 - `src/ui.rs` - ratatui rendering and popup widgets.
 - `src/gitlab.rs` - GitLab HTTP client.
 - `src/config.rs` - CLI/env/config loading and persistence.
@@ -143,7 +144,7 @@ It captures the repository-specific commands, expectations, and coding style.
 - Preserve cursor visibility and blinking behavior while text editing.
 - Maintain draft persistence for issue edits and comment drafts.
 - Keep mention picker behavior: typing `#` opens picker, `Enter` inserts `#iid`, `Esc` skips.
-- Multi-project switching should work from a picker and cycle keys without prefetching unopened projects.
+- Multi-project switching should work from a picker and cycle keys while background preloads continue.
 - New stored projects should inherit the current theme.
 
 ## Theme Rules
@@ -156,7 +157,7 @@ It captures the repository-specific commands, expectations, and coding style.
 ## GitLab API Rules
 
 - Reuse `GitLabClient` for network operations.
-- Keep blocking HTTP behavior unless a larger async refactor is explicitly requested.
+- Prefer the async background loader for preload and user-triggered network work.
 - When adding API features, update both model structs and preload/cache behavior if detail views depend on them.
 - For issue detail performance, prefer loading/caching at refresh time when feasible.
 
