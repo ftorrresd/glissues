@@ -797,7 +797,7 @@ impl App {
 
     pub fn mode_label(&self) -> &'static str {
         match self.mode {
-            Mode::Normal => "BROWSE",
+            Mode::Normal => "glissues",
             Mode::IssueView => "ISSUE",
             Mode::ConfirmDelete => "DELETE",
             Mode::BlockerPicker => "BLOCKERS",
