@@ -202,6 +202,16 @@ impl GitLabClient {
         Ok(())
     }
 
+    pub fn delete_label(&self, label_name: &str) -> Result<()> {
+        self.http
+            .delete(self.url(&format!("/labels/{}", urlencoding::encode(label_name))))
+            .send()
+            .context("failed to delete label")?
+            .error_for_status()
+            .context("GitLab rejected label deletion")?;
+        Ok(())
+    }
+
     fn get_paginated<T>(&self, path: &str, query: &[(&str, String)]) -> Result<Vec<T>>
     where
         T: DeserializeOwned,

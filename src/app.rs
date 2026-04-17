@@ -76,11 +76,22 @@ pub struct CommentEditorState {
     pub body: TextBuffer,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum LabelPane {
+    Add,
+    Exclude,
+}
+
 #[derive(Debug, Clone)]
 pub struct LabelPickerState {
     pub query: String,
-    pub selected: BTreeSet<String>,
-    pub cursor: usize,
+    pub current_labels: BTreeSet<String>,
+    pub to_add: BTreeSet<String>,
+    pub to_exclude: BTreeSet<String>,
+    pub cursor_add: usize,
+    pub cursor_exclude: usize,
+    pub active_pane: LabelPane,
+    pub history: Vec<(BTreeSet<String>, BTreeSet<String>)>,
 }
 
 #[derive(Debug, Clone)]
@@ -233,6 +244,10 @@ enum PendingActionResult {
         links: Vec<IssueLink>,
         message: String,
     },
+    LabelDeleted {
+        label: String,
+        message: String,
+    },
 }
 
 pub struct App {
@@ -279,6 +294,7 @@ pub struct App {
     next_load_generation: u64,
     loading: Option<LoadingState>,
     pending_action: Option<PendingActionState>,
+    undo_history: Vec<Issue>,
 }
 
 impl App {
@@ -362,6 +378,7 @@ impl App {
             next_load_generation: 1,
             loading: None,
             pending_action: None,
+            undo_history: Vec::new(),
         };
 
         if !app
@@ -910,9 +927,17 @@ impl App {
                 self.pending_g = false;
                 self.open_due_date_picker();
             }
-            KeyCode::Tab | KeyCode::BackTab => {
+            KeyCode::Char('u') => {
+                self.pending_g = false;
+                self.undo_issue_state()?;
+            }
+            KeyCode::Tab => {
                 self.pending_g = false;
                 self.cycle_state_filter()?;
+            }
+            KeyCode::BackTab => {
+                self.pending_g = false;
+                self.cycle_state_filter_backwards()?;
             }
             KeyCode::Char('f') => {
                 self.pending_g = false;
@@ -1392,30 +1417,93 @@ impl App {
                 self.restore_return_mode();
             }
             KeyCode::Enter => return self.save_label_picker(),
+            KeyCode::Tab => {
+                picker.active_pane = match picker.active_pane {
+                    LabelPane::Add => LabelPane::Exclude,
+                    LabelPane::Exclude => LabelPane::Add,
+                };
+            }
+            KeyCode::Char('h') | KeyCode::Left => {
+                picker.active_pane = LabelPane::Add;
+            }
+            KeyCode::Char('l') | KeyCode::Right => {
+                picker.active_pane = LabelPane::Exclude;
+            }
             KeyCode::Backspace => {
                 if picker.query.is_empty() {
-                    if let Some(last) = picker.selected.iter().last().cloned() {
-                        picker.selected.remove(&last);
+                    match picker.active_pane {
+                        LabelPane::Add => {
+                            if let Some(last) = picker.to_add.iter().last().cloned() {
+                                picker.to_add.remove(&last);
+                            }
+                        }
+                        LabelPane::Exclude => {
+                            if let Some(last) = picker.to_exclude.iter().last().cloned() {
+                                picker.to_exclude.remove(&last);
+                            }
+                        }
                     }
                 } else {
                     picker.query.pop();
                 }
-                picker.cursor = 0;
             }
             KeyCode::Char('j') | KeyCode::Down => {
-                let count = picker.filtered_labels(&self.labels).len().max(1);
-                picker.cursor = (picker.cursor + 1).min(count - 1);
+                match picker.active_pane {
+                    LabelPane::Add => {
+                        let count = picker.filtered_labels(&self.labels).len().max(1);
+                        picker.cursor_add = (picker.cursor_add + 1).min(count - 1);
+                    }
+                    LabelPane::Exclude => {
+                        let count = picker.filtered_exclude_labels().len().max(1);
+                        picker.cursor_exclude = (picker.cursor_exclude + 1).min(count - 1);
+                    }
+                }
             }
             KeyCode::Char('k') | KeyCode::Up => {
-                picker.cursor = picker.cursor.saturating_sub(1);
+                match picker.active_pane {
+                    LabelPane::Add => {
+                        picker.cursor_add = picker.cursor_add.saturating_sub(1);
+                    }
+                    LabelPane::Exclude => {
+                        picker.cursor_exclude = picker.cursor_exclude.saturating_sub(1);
+                    }
+                }
             }
             KeyCode::Char(' ') => {
-                if let Some(label) = picker.current_choice(&self.labels) {
-                    if picker.selected.contains(&label) {
-                        picker.selected.remove(&label);
-                    } else {
-                        picker.selected.insert(label);
+                picker.push_history();
+                match picker.active_pane {
+                    LabelPane::Add => {
+                        if let Some(label) = picker.current_choice_add(&self.labels) {
+                            if picker.to_add.contains(&label) {
+                                picker.to_add.remove(&label);
+                            } else {
+                                picker.to_add.insert(label.clone());
+                                picker.to_exclude.remove(&label);
+                            }
+                        }
                     }
+                    LabelPane::Exclude => {
+                        if let Some(label) = picker.current_choice_exclude() {
+                            if picker.to_exclude.contains(&label) {
+                                picker.to_exclude.remove(&label);
+                            } else {
+                                picker.to_exclude.insert(label.clone());
+                                picker.to_add.remove(&label);
+                            }
+                        }
+                    }
+                }
+            }
+            KeyCode::Char('u') if picker.query.is_empty() => {
+                picker.undo();
+            }
+            KeyCode::Char('d') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                if let Some(label) = match picker.active_pane {
+                    LabelPane::Add => picker.current_choice_add(&self.labels),
+                    LabelPane::Exclude => picker.current_choice_exclude(),
+                } {
+                    picker.push_history();
+                    return self.delete_label_from_project(&label);
                 }
             }
             KeyCode::Char(ch)
@@ -1424,7 +1512,6 @@ impl App {
                     .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
             {
                 picker.query.push(ch);
-                picker.cursor = 0;
             }
             _ => {}
         }
@@ -1445,6 +1532,28 @@ impl App {
                 self.restore_return_mode();
             }
             KeyCode::Enter => return self.apply_selector(),
+            KeyCode::Char(' ') => {
+                let filtered = selector.filtered_options();
+                if let Some(option) = filtered.get(selector.cursor) {
+                    if selector.selected.as_deref() == Some(option.as_str()) {
+                        selector.selected = None;
+                    } else {
+                        selector.selected = Some(option.clone());
+                    }
+                    if self.selector_kind == Some(SelectorKind::LabelFilter) {
+                        self.filters.label = selector.selected.clone();
+                        self.selected = 0;
+                        self.issue_view_scroll = 0;
+                        self.clamp_selection();
+                        self.ensure_selected_notes_loaded()?;
+                        self.ensure_selected_issue_links_loaded()?;
+                        self.status_line = match &self.filters.label {
+                            Some(label) => format!("label filter: {label}"),
+                            None => String::from("label filter cleared"),
+                        };
+                    }
+                }
+            }
             KeyCode::Backspace => {
                 if selector.query.is_empty() && selector.allow_clear {
                     selector.selected = None;
@@ -1459,10 +1568,6 @@ impl App {
             }
             KeyCode::Char('k') | KeyCode::Up => {
                 selector.cursor = selector.cursor.saturating_sub(1);
-            }
-            KeyCode::Char('x') if selector.allow_clear => {
-                selector.selected = None;
-                return self.apply_selector();
             }
             KeyCode::Char(ch)
                 if !key
@@ -2142,6 +2247,15 @@ impl App {
         self.set_state_filter(next)
     }
 
+    fn cycle_state_filter_backwards(&mut self) -> Result<()> {
+        let next = match self.filters.state {
+            StateFilter::All => StateFilter::Closed,
+            StateFilter::Closed => StateFilter::Open,
+            StateFilter::Open => StateFilter::All,
+        };
+        self.set_state_filter(next)
+    }
+
     pub fn scroll_issue_view_by(&mut self, delta: i16) {
         let max_scroll = self.max_issue_view_scroll();
         let next = if delta >= 0 {
@@ -2171,6 +2285,10 @@ impl App {
     fn close_selected_issue(&mut self) -> Result<()> {
         if self.has_pending_action_guard() {
             return Ok(());
+        }
+
+        if let Some(issue) = self.selected_issue() {
+            self.undo_history.push(issue.clone());
         }
 
         let iid = self
@@ -2204,6 +2322,10 @@ impl App {
             return Ok(());
         }
 
+        if let Some(issue) = self.selected_issue() {
+            self.undo_history.push(issue.clone());
+        }
+
         let iid = self
             .selected_issue()
             .map(|issue| issue.iid)
@@ -2227,6 +2349,14 @@ impl App {
             })
         });
 
+        Ok(())
+    }
+
+    fn undo_issue_state(&mut self) -> Result<()> {
+        if let Some(previous_issue) = self.undo_history.pop() {
+            self.replace_issue(previous_issue);
+            self.status_line = String::from("undo");
+        }
         Ok(())
     }
 
@@ -2444,7 +2574,7 @@ impl App {
     }
 
     fn open_label_editor(&mut self) {
-        let Some(selected) = self
+        let Some(current_labels) = self
             .selected_issue()
             .map(|issue| issue.labels.iter().cloned().collect::<BTreeSet<_>>())
         else {
@@ -2454,8 +2584,13 @@ impl App {
         self.capture_return_mode();
         self.label_picker = Some(LabelPickerState {
             query: String::new(),
-            selected,
-            cursor: 0,
+            current_labels,
+            to_add: BTreeSet::new(),
+            to_exclude: BTreeSet::new(),
+            cursor_add: 0,
+            cursor_exclude: 0,
+            active_pane: LabelPane::Add,
+            history: Vec::new(),
         });
         self.mode = Mode::LabelEditor;
     }
@@ -2472,7 +2607,15 @@ impl App {
             .selected_issue()
             .map(|issue| issue.iid)
             .ok_or_else(|| anyhow!("no issue selected"))?;
-        let labels = picker.selected.into_iter().collect::<Vec<_>>();
+
+        let labels = picker
+            .current_labels
+            .union(&picker.to_add)
+            .cloned()
+            .collect::<BTreeSet<_>>()
+            .difference(&picker.to_exclude)
+            .cloned()
+            .collect::<Vec<_>>();
 
         self.restore_return_mode();
 
@@ -2493,6 +2636,28 @@ impl App {
                 Ok(PendingActionResult::IssueUpdated {
                     issue,
                     message: format!("labels updated for #{}", iid),
+                })
+            },
+        );
+
+        Ok(())
+    }
+
+    fn delete_label_from_project(&mut self, label: &str) -> Result<()> {
+        if self.has_pending_action_guard() {
+            return Ok(());
+        }
+
+        let label = label.to_string();
+        let config = self.config.clone();
+        self.begin_background_action(
+            format!("deleting label '{}' from project", label),
+            async move {
+                let client = AsyncGitLabClient::new(&config)?;
+                client.delete_label(&label).await?;
+                Ok(PendingActionResult::LabelDeleted {
+                    label: label.clone(),
+                    message: format!("label '{}' deleted", label),
                 })
             },
         );
@@ -2896,6 +3061,13 @@ impl App {
                 self.status_line = message;
             }
             (
+                PendingActionState::Background { .. },
+                Ok(PendingActionResult::LabelDeleted { label, message }),
+            ) => {
+                self.labels.retain(|l| l != &label);
+                self.status_line = message;
+            }
+            (
                 PendingActionState::IssueSave {
                     draft, return_mode, ..
                 },
@@ -2978,12 +3150,53 @@ impl LabelPickerState {
         options
     }
 
-    pub fn current_choice(&self, labels: &[String]) -> Option<String> {
+    pub fn filtered_exclude_labels(&self) -> Vec<String> {
+        let query = self.query.trim().to_lowercase();
+        let mut options = self
+            .current_labels
+            .iter()
+            .filter(|label| {
+                if query.is_empty() {
+                    true
+                } else {
+                    label.to_lowercase().contains(&query)
+                }
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        options.sort();
+        options
+    }
+
+    pub fn current_choice_add(&self, labels: &[String]) -> Option<String> {
         let filtered = self.filtered_labels(labels);
         if filtered.is_empty() {
             return (!self.query.trim().is_empty()).then(|| self.query.trim().to_string());
         }
-        filtered.get(self.cursor.min(filtered.len() - 1)).cloned()
+        filtered
+            .get(self.cursor_add.min(filtered.len() - 1))
+            .cloned()
+    }
+
+    pub fn current_choice_exclude(&self) -> Option<String> {
+        let filtered = self.filtered_exclude_labels();
+        if filtered.is_empty() {
+            return None;
+        }
+        filtered
+            .get(self.cursor_exclude.min(filtered.len() - 1))
+            .cloned()
+    }
+
+    pub fn push_history(&mut self) {
+        self.history.push((self.to_add.clone(), self.to_exclude.clone()));
+    }
+
+    pub fn undo(&mut self) {
+        if let Some((to_add, to_exclude)) = self.history.pop() {
+            self.to_add = to_add;
+            self.to_exclude = to_exclude;
+        }
     }
 }
 

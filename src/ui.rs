@@ -582,37 +582,22 @@ fn draw_comment_editor(frame: &mut Frame, area: Rect, app: &App) {
 }
 
 fn draw_label_editor(frame: &mut Frame, area: Rect, app: &App) {
+    use crate::app::LabelPane;
+
     let c = colors(app.theme.palette());
     let Some(picker) = app.label_picker.as_ref() else {
         return;
     };
-    let popup = centered_rect(62, 64, area);
+    let popup = centered_rect(72, 64, area);
     let sections = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
             Constraint::Length(3),
-            Constraint::Length(4),
-            Constraint::Min(8),
+            Constraint::Min(12),
             Constraint::Length(1),
         ])
         .margin(1)
         .split(popup);
-
-    let filtered = picker.filtered_labels(&app.labels);
-    let mut items = Vec::new();
-    for label in &filtered {
-        let mark = if picker.selected.contains(label) {
-            "[x]"
-        } else {
-            "[ ]"
-        };
-        items.push(ListItem::new(Line::from(format!("{mark} {label}"))));
-    }
-    if items.is_empty() {
-        items.push(ListItem::new(Line::from(
-            "No labels yet. Type to create one.",
-        )));
-    }
 
     frame.render_widget(Clear, popup);
     frame.render_widget(
@@ -622,39 +607,95 @@ fn draw_label_editor(frame: &mut Frame, area: Rect, app: &App) {
             .style(Style::default().bg(c.panel).fg(c.text)),
         popup,
     );
+
     frame.render_widget(
         Paragraph::new(picker.query.as_str())
-            .block(styled_block(c, "Search or Create"))
+            .block(styled_block(c, "Search"))
             .style(Style::default().bg(c.panel_alt).fg(c.text)),
         sections[0],
     );
-    frame.render_widget(
-        Paragraph::new(
-            picker
-                .selected
-                .iter()
-                .cloned()
-                .collect::<Vec<_>>()
-                .join("  "),
+
+    let panes = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
+        .split(sections[1]);
+
+    let filtered_add = picker.filtered_labels(&app.labels);
+    let mut add_items = Vec::new();
+    for label in &filtered_add {
+        let mark = if picker.to_add.contains(label) {
+            "[+]"
+        } else if picker.to_exclude.contains(label) {
+            "[-]"
+        } else {
+            "[ ]"
+        };
+        add_items.push(ListItem::new(Line::from(format!("{mark} {label}"))));
+    }
+    if add_items.is_empty() && picker.query.is_empty() {
+        add_items.push(ListItem::new(Line::from("(no labels)")));
+    }
+
+    let add_border_style = if picker.active_pane == LabelPane::Add {
+        Style::default().bg(c.panel).fg(c.accent)
+    } else {
+        Style::default().bg(c.panel).fg(c.text)
+    };
+    let add_list = List::new(add_items)
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title("Add")
+                .style(add_border_style),
         )
-        .block(styled_block(c, "Selected"))
-        .style(Style::default().bg(c.panel).fg(c.text))
-        .wrap(Wrap { trim: false }),
-        sections[1],
-    );
-    let list = List::new(items)
-        .block(styled_block(c, "Autocomplete"))
         .highlight_symbol("▎")
         .highlight_style(Style::default().bg(c.panel_alt).fg(c.text));
-    let mut state = ListState::default();
-    if !filtered.is_empty() {
-        state.select(Some(picker.cursor.min(filtered.len() - 1)));
+    let mut add_state = ListState::default();
+    if !filtered_add.is_empty() {
+        add_state.select(Some(picker.cursor_add.min(filtered_add.len() - 1)));
     }
-    frame.render_stateful_widget(list, sections[2], &mut state);
+    frame.render_stateful_widget(add_list, panes[0], &mut add_state);
+
+    let filtered_exclude = picker.filtered_exclude_labels();
+    let mut exclude_items = Vec::new();
+    for label in &filtered_exclude {
+        let mark = if picker.to_exclude.contains(label) {
+            "[-]"
+        } else if picker.to_add.contains(label) {
+            "[+]"
+        } else {
+            "[ ]"
+        };
+        exclude_items.push(ListItem::new(Line::from(format!("{mark} {label}"))));
+    }
+    if exclude_items.is_empty() {
+        exclude_items.push(ListItem::new(Line::from("(no current labels)")));
+    }
+
+    let exclude_border_style = if picker.active_pane == LabelPane::Exclude {
+        Style::default().bg(c.panel).fg(c.accent)
+    } else {
+        Style::default().bg(c.panel).fg(c.text)
+    };
+    let exclude_list = List::new(exclude_items)
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title("Exclude")
+                .style(exclude_border_style),
+        )
+        .highlight_symbol("▎")
+        .highlight_style(Style::default().bg(c.panel_alt).fg(c.text));
+    let mut exclude_state = ListState::default();
+    if !filtered_exclude.is_empty() {
+        exclude_state.select(Some(picker.cursor_exclude.min(filtered_exclude.len() - 1)));
+    }
+    frame.render_stateful_widget(exclude_list, panes[1], &mut exclude_state);
+
     frame.render_widget(
-        Paragraph::new("type to filter  Space toggle  Enter save  Esc cancel")
+        Paragraph::new("Tab switch  Space toggle  u undo  C-d delete  Enter save  Esc cancel")
             .style(Style::default().fg(c.muted).bg(c.panel)),
-        sections[3],
+        sections[2],
     );
 }
 
@@ -712,12 +753,8 @@ fn draw_selector(frame: &mut Frame, area: Rect, app: &App) {
     }
     frame.render_stateful_widget(list, sections[1], &mut state);
     frame.render_widget(
-        Paragraph::new(if selector.allow_clear {
-            "type to filter  Enter apply  x clear  Esc cancel"
-        } else {
-            "type to filter  Enter apply  Esc cancel"
-        })
-        .style(Style::default().fg(c.muted).bg(c.panel)),
+        Paragraph::new("type to filter  Space toggle  Esc cancel")
+            .style(Style::default().fg(c.muted).bg(c.panel)),
         sections[2],
     );
 }
