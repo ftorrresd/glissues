@@ -117,31 +117,27 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
 
 fn draw_header(frame: &mut Frame, area: Rect, app: &App) {
     let c = colors(app.theme.palette());
-    let status = format!(
-        " {}  {}  projects:{}  theme:{}  open:{}  closed:{}  overdue:{}  state:{}  label:{}  search:{} ",
-        app.mode_label(),
-        app.config.project,
-        app.projects.len(),
-        app.theme.name.display_name(),
-        app.count_open(),
-        app.count_closed(),
-        app.count_overdue(),
-        app.state_label(),
-        app.filters.label.as_deref().unwrap_or("any"),
-        if app.filters.search.is_empty() {
-            "off"
-        } else {
-            app.filters.search.as_str()
-        },
-    );
+    let sep = Span::styled(" │ ", Style::default().bg(c.panel_alt).fg(c.muted));
+    let seg = |s: String| Span::styled(s, Style::default().bg(c.panel_alt).fg(c.text));
+
+    let line = Line::from(vec![
+        seg(format!(" {} ", app.mode_label())),
+        sep.clone(),
+        seg(app.config.project.clone()),
+        sep.clone(),
+        seg(format!("open:{}  closed:{}  overdue:{}", app.count_open(), app.count_closed(), app.count_overdue())),
+        sep.clone(),
+        seg(format!("state:{}", app.state_label())),
+        sep.clone(),
+        seg(format!("label:{}", app.filters.label.as_deref().unwrap_or("any"))),
+        sep.clone(),
+        seg(format!("search:{}", if app.filters.search.is_empty() { "off" } else { &app.filters.search })),
+        sep.clone(),
+        seg(format!("theme:{} ", app.theme.name.display_name())),
+    ]);
 
     frame.render_widget(
-        Paragraph::new(status).style(
-            Style::default()
-                .bg(c.panel_alt)
-                .fg(c.text)
-                .add_modifier(Modifier::BOLD),
-        ),
+        Paragraph::new(line).style(Style::default().bg(c.panel_alt)),
         area,
     );
 }
@@ -154,7 +150,7 @@ fn draw_sidebar(frame: &mut Frame, area: Rect, app: &App) {
     let lines = vec![
         Line::from(vec![Span::styled(
             "Views",
-            Style::default().fg(c.accent).add_modifier(Modifier::BOLD),
+            Style::default().fg(c.accent),
         )]),
         sidebar_line(c, "All", app.issues.len(), app.state_label() == "all"),
         sidebar_line(c, "Open", app.count_open(), app.state_label() == "open"),
@@ -168,7 +164,7 @@ fn draw_sidebar(frame: &mut Frame, area: Rect, app: &App) {
         Line::default(),
         Line::from(vec![Span::styled(
             "Scope",
-            Style::default().fg(c.accent).add_modifier(Modifier::BOLD),
+            Style::default().fg(c.accent),
         )]),
         Line::from(vec![
             Span::styled("Label  ", Style::default().fg(c.muted)),
@@ -191,7 +187,7 @@ fn draw_sidebar(frame: &mut Frame, area: Rect, app: &App) {
         Line::default(),
         Line::from(vec![Span::styled(
             "Agenda",
-            Style::default().fg(c.accent).add_modifier(Modifier::BOLD),
+            Style::default().fg(c.accent),
         )]),
         Line::from(vec![
             Span::styled("Today  ", Style::default().fg(c.muted)),
@@ -266,7 +262,7 @@ fn draw_issue_list(frame: &mut Frame, area: Rect, app: &App) {
                 Span::styled(format!("{state_marker} "), state_style),
                 Span::styled(
                     format!("#{} {}", issue.iid, issue.title),
-                    Style::default().fg(c.text).add_modifier(Modifier::BOLD),
+                    Style::default().fg(c.text),
                 ),
             ]),
             Line::from(Span::styled(meta, Style::default().fg(c.muted))),
@@ -285,8 +281,7 @@ fn draw_issue_list(frame: &mut Frame, area: Rect, app: &App) {
         .highlight_style(
             Style::default()
                 .bg(c.panel_alt)
-                .fg(c.text)
-                .add_modifier(Modifier::BOLD),
+                .fg(c.text),
         )
         .highlight_symbol("▎");
 
@@ -354,7 +349,7 @@ fn draw_help(frame: &mut Frame, area: Rect, app: &App) {
     let text = Text::from(vec![
         Line::from(Span::styled(
             "glissues keymap",
-            Style::default().fg(c.accent).add_modifier(Modifier::BOLD),
+            Style::default().fg(c.accent),
         )),
         Line::default(),
         Line::from("j / k          move through the issue list"),
@@ -388,7 +383,7 @@ fn draw_help(frame: &mut Frame, area: Rect, app: &App) {
         Line::default(),
         Line::from(Span::styled(
             "Editors",
-            Style::default().fg(c.accent).add_modifier(Modifier::BOLD),
+            Style::default().fg(c.accent),
         )),
         Line::from("Typing         always inserts text"),
         Line::from("Esc            close the editor or comment popup"),
@@ -435,7 +430,7 @@ fn draw_confirm_delete(frame: &mut Frame, area: Rect, app: &App) {
     let text = Text::from(vec![
         Line::from(Span::styled(
             "Delete issue?",
-            Style::default().fg(c.danger).add_modifier(Modifier::BOLD),
+            Style::default().fg(c.danger),
         )),
         Line::default(),
         Line::from(vec![
@@ -1039,7 +1034,7 @@ fn draw_store_project_prompt(frame: &mut Frame, area: Rect, app: &App) {
     let text = Text::from(vec![
         Line::from(Span::styled(
             "Store this project for later?",
-            Style::default().fg(c.accent).add_modifier(Modifier::BOLD),
+            Style::default().fg(c.accent),
         )),
         Line::default(),
         Line::from(Span::styled(
@@ -1141,12 +1136,12 @@ fn draw_loading(frame: &mut Frame, area: Rect, app: &App) {
         Line::from(vec![
             Span::styled(
                 app.spinner_frame(),
-                Style::default().fg(c.accent).add_modifier(Modifier::BOLD),
+                Style::default().fg(c.accent),
             ),
             Span::raw("  "),
             Span::styled(
                 message,
-                Style::default().fg(c.text).add_modifier(Modifier::BOLD),
+                Style::default().fg(c.text),
             ),
         ]),
         Line::default(),
@@ -1173,7 +1168,7 @@ fn draw_alert(frame: &mut Frame, area: Rect, app: &App) {
     let mut lines = vec![
         Line::from(Span::styled(
             alert.title.clone(),
-            Style::default().fg(c.danger).add_modifier(Modifier::BOLD),
+            Style::default().fg(c.danger),
         )),
         Line::default(),
     ];
@@ -1203,12 +1198,12 @@ fn issue_text(app: &App, include_actions: bool) -> Text<'static> {
             Line::from(vec![
                 Span::styled(
                     format!("#{}", issue.iid),
-                    Style::default().fg(c.accent).add_modifier(Modifier::BOLD),
+                    Style::default().fg(c.accent),
                 ),
                 Span::raw(" "),
                 Span::styled(
                     issue.title.clone(),
-                    Style::default().fg(c.text).add_modifier(Modifier::BOLD),
+                    Style::default().fg(c.text),
                 ),
             ]),
             Line::from(vec![
@@ -1261,7 +1256,7 @@ fn issue_text(app: &App, include_actions: bool) -> Text<'static> {
         lines.push(Line::default());
         lines.push(Line::from(Span::styled(
             "Blockers",
-            Style::default().fg(c.iris).add_modifier(Modifier::BOLD),
+            Style::default().fg(c.iris),
         )));
         let blockers = app.selected_blockers();
         if !app.selected_issue_links_loaded() {
@@ -1288,7 +1283,7 @@ fn issue_text(app: &App, include_actions: bool) -> Text<'static> {
         lines.push(Line::default());
         lines.push(Line::from(Span::styled(
             "Description",
-            Style::default().fg(c.accent).add_modifier(Modifier::BOLD),
+            Style::default().fg(c.accent),
         )));
 
         let body = render_markdown(&issue.description, app.theme.palette());
@@ -1296,7 +1291,7 @@ fn issue_text(app: &App, include_actions: bool) -> Text<'static> {
         lines.push(Line::default());
         lines.push(Line::from(Span::styled(
             "Comments",
-            Style::default().fg(c.accent).add_modifier(Modifier::BOLD),
+            Style::default().fg(c.accent),
         )));
 
         match app.selected_notes() {
@@ -1320,7 +1315,7 @@ fn issue_text(app: &App, include_actions: bool) -> Text<'static> {
                     lines.push(Line::from(vec![
                         Span::styled(
                             author,
-                            Style::default().fg(c.warn).add_modifier(Modifier::BOLD),
+                            Style::default().fg(c.warn),
                         ),
                         Span::raw("  "),
                         Span::styled(
@@ -1379,8 +1374,7 @@ fn calendar_text(picker: &DueDatePickerState, c: Colors) -> Text<'static> {
                 Style::default()
                     .bg(c.accent)
                     .fg(c.bg)
-                    .add_modifier(Modifier::BOLD)
-            } else if date == today {
+                } else if date == today {
                 Style::default().fg(c.warn).add_modifier(Modifier::BOLD)
             } else {
                 Style::default().fg(c.text)
@@ -1404,7 +1398,7 @@ fn due_style(issue: &crate::model::Issue, c: Colors) -> Style {
 
     let today = Local::now().date_naive();
     match issue.due_date.as_deref().and_then(parse_due_date) {
-        Some(date) if date < today => Style::default().fg(c.danger).add_modifier(Modifier::BOLD),
+        Some(date) if date < today => Style::default().fg(c.danger),
         Some(date) if date <= today + Duration::days(2) => {
             Style::default().fg(c.warn).add_modifier(Modifier::BOLD)
         }
@@ -1524,7 +1518,6 @@ fn sidebar_line(c: Colors, label: &str, count: usize, active: bool) -> Line<'sta
         Style::default()
             .fg(c.text)
             .bg(c.panel_alt)
-            .add_modifier(Modifier::BOLD)
     } else {
         Style::default().fg(c.text)
     };
