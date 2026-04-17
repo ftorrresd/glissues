@@ -599,6 +599,13 @@ impl App {
             .unwrap_or(" ")
     }
 
+    pub fn spinner_index(&self) -> usize {
+        self.loading
+            .as_ref()
+            .map(|loading| loading.spinner_frame % SPINNER_FRAMES.len())
+            .unwrap_or(0)
+    }
+
     pub fn has_alert(&self) -> bool {
         self.alert.is_some()
     }

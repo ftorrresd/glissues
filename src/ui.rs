@@ -1134,56 +1134,78 @@ fn draw_due_date_picker(frame: &mut Frame, area: Rect, app: &App) {
 
 fn draw_loading(frame: &mut Frame, area: Rect, app: &App) {
     let c = colors(app.theme.palette());
-    let popup = centered_rect(50, 28, area);
+    let popup = centered_rect(48, 22, area);
+
+    let spinner_idx = app.spinner_index();
+
+    let animations = [
+        ("  o_o  ", "waking up..."),
+        ("  -_-  ", "focusing..."),
+        ("  O_O  ", "wow!"),
+        ("  o_o  ", "loading..."),
+    ];
+
+    let (face, status) = animations[spinner_idx % animations.len()];
+
     let message = app.loading_message().unwrap_or("Loading GitLab data");
     let detail = app
         .loading_progress_label()
-        .unwrap_or_else(|| String::from("Please wait..."));
+        .unwrap_or_else(|| String::from("fetching..."));
+
+    let progress = detail
+        .split('/')
+        .next()
+        .and_then(|s| s.trim().parse::<usize>().ok())
+        .unwrap_or(0);
+    let total = detail
+        .split('/')
+        .nth(1)
+        .and_then(|s| s.trim().split(' ').next())
+        .and_then(|s| s.parse::<usize>().ok())
+        .unwrap_or(1);
+
+    let bar_width = 30;
+    let filled = if total > 0 {
+        ((progress as f64 / total as f64) * bar_width as f64) as usize
+    } else {
+        0
+    };
+
+    let progress_bar = format!(
+        "[{}{}] {}/{}",
+        "=".repeat(filled),
+        " ".repeat(bar_width - filled),
+        progress,
+        total
+    );
 
     let lines = vec![
         Line::default(),
+        Line::from(vec![Span::styled(
+            "      GLISSUES - GitLab Issues",
+            Style::default()
+                .fg(c.accent_alt)
+                .add_modifier(Modifier::BOLD),
+        )]),
         Line::default(),
         Line::from(vec![Span::styled(
-            "  ╔═════════════════════════════════════════════╗  ",
+            format!("        {}", face),
             Style::default().fg(c.accent),
         )]),
-        Line::from(vec![
-            Span::styled("  ║", Style::default().fg(c.accent)),
-            Span::styled(
-                "            ✨ glissues ✨            ",
-                Style::default()
-                    .fg(c.accent_alt)
-                    .add_modifier(Modifier::BOLD),
-            ),
-            Span::styled("║  ", Style::default().fg(c.accent)),
-        ]),
-        Line::from(vec![
-            Span::styled("  ║", Style::default().fg(c.accent)),
-            Span::styled(
-                "   Fetching issues from GitLab   ",
-                Style::default().fg(c.text),
-            ),
-            Span::styled("║  ", Style::default().fg(c.accent)),
-        ]),
         Line::from(vec![Span::styled(
-            "  ╚═════════════════════════════════════════════╝  ",
+            format!("      {}", status),
+            Style::default().fg(c.accent_alt),
+        )]),
+        Line::default(),
+        Line::from(vec![Span::styled(
+            &progress_bar,
             Style::default().fg(c.accent),
         )]),
         Line::default(),
-        Line::from(vec![
-            Span::raw("  "),
-            Span::styled(app.spinner_frame(), Style::default().fg(c.accent_alt)),
-            Span::raw("  "),
-            Span::styled(
-                message,
-                Style::default().fg(c.text).add_modifier(Modifier::BOLD),
-            ),
-        ]),
-        Line::default(),
-        Line::from(vec![
-            Span::raw("  "),
-            Span::styled(detail, Style::default().fg(c.accent)),
-        ]),
+        Line::from(vec![Span::styled(
+            message,
+            Style::default().fg(c.text).add_modifier(Modifier::BOLD),
+        )]),
         Line::default(),
     ];
 
@@ -1191,9 +1213,7 @@ fn draw_loading(frame: &mut Frame, area: Rect, app: &App) {
 
     frame.render_widget(Clear, popup);
     frame.render_widget(
-        Paragraph::new(text)
-            .style(Style::default().bg(c.panel).fg(c.text))
-            .wrap(Wrap { trim: false }),
+        Paragraph::new(text).style(Style::default().bg(c.panel).fg(c.text)),
         popup,
     );
 }
