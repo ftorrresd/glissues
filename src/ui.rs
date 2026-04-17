@@ -410,7 +410,7 @@ fn draw_issue_view(frame: &mut Frame, area: Rect, app: &mut App) {
     let c = colors(app.theme.palette());
     let popup = centered_rect(86, 88, area);
     let content = issue_text(app, true);
-    let inner = Block::default().borders(Borders::ALL).inner(popup);
+    let inner = Block::default().borders(Borders::ALL).border_set(rounded_border_set()).inner(popup);
     let content_height = wrapped_text_height(&content, inner.width);
     app.sync_issue_view_layout(inner.height, content_height);
 
@@ -485,6 +485,7 @@ fn draw_issue_editor(frame: &mut Frame, area: Rect, app: &App) {
     frame.render_widget(
         Block::default()
             .borders(Borders::ALL)
+            .border_set(rounded_border_set())
             .title(if editor.editing_iid.is_some() {
                 "Edit Issue"
             } else {
@@ -527,14 +528,14 @@ fn draw_issue_editor(frame: &mut Frame, area: Rect, app: &App) {
 
     match editor.focus {
         EditorField::Title => {
-            let inner = Block::default().borders(Borders::ALL).inner(sections[0]);
+            let inner = Block::default().borders(Borders::ALL).border_set(rounded_border_set()).inner(sections[0]);
             frame.set_cursor_position((
                 inner.x + editor.title.col() as u16,
                 inner.y + editor.title.row() as u16,
             ));
         }
         EditorField::Body => {
-            let inner = Block::default().borders(Borders::ALL).inner(sections[1]);
+            let inner = Block::default().borders(Borders::ALL).border_set(rounded_border_set()).inner(sections[1]);
             let (_, cursor_x, cursor_y) = editor_viewport(&editor.body, inner.width, inner.height);
             frame.set_cursor_position((inner.x + cursor_x, inner.y + cursor_y));
         }
@@ -558,6 +559,7 @@ fn draw_comment_editor(frame: &mut Frame, area: Rect, app: &App) {
     frame.render_widget(
         Block::default()
             .borders(Borders::ALL)
+            .border_set(rounded_border_set())
             .title("New Comment")
             .style(Style::default().bg(c.panel).fg(c.text)),
         popup,
@@ -576,7 +578,7 @@ fn draw_comment_editor(frame: &mut Frame, area: Rect, app: &App) {
         inner[1],
     );
 
-    let cursor = Block::default().borders(Borders::ALL).inner(inner[0]);
+    let cursor = Block::default().borders(Borders::ALL).border_set(rounded_border_set()).inner(inner[0]);
     let (_, cursor_x, cursor_y) = editor_viewport(&editor.body, cursor.width, cursor.height);
     frame.set_cursor_position((cursor.x + cursor_x, cursor.y + cursor_y));
 }
@@ -603,6 +605,7 @@ fn draw_label_editor(frame: &mut Frame, area: Rect, app: &App) {
     frame.render_widget(
         Block::default()
             .borders(Borders::ALL)
+            .border_set(rounded_border_set())
             .title("Edit Labels")
             .style(Style::default().bg(c.panel).fg(c.text)),
         popup,
@@ -733,6 +736,7 @@ fn draw_selector(frame: &mut Frame, area: Rect, app: &App) {
     frame.render_widget(
         Block::default()
             .borders(Borders::ALL)
+            .border_set(rounded_border_set())
             .title(selector.title.as_str())
             .style(Style::default().bg(c.panel).fg(c.text)),
         popup,
@@ -804,6 +808,7 @@ fn draw_mention_picker(frame: &mut Frame, area: Rect, app: &App) {
     frame.render_widget(
         Block::default()
             .borders(Borders::ALL)
+            .border_set(rounded_border_set())
             .title("Mention Issue")
             .style(Style::default().bg(c.panel).fg(c.text)),
         popup,
@@ -892,6 +897,7 @@ fn draw_blocker_picker(frame: &mut Frame, area: Rect, app: &App) {
     frame.render_widget(
         Block::default()
             .borders(Borders::ALL)
+            .border_set(rounded_border_set())
             .title(title)
             .style(Style::default().bg(c.panel).fg(c.text)),
         popup,
@@ -991,6 +997,7 @@ fn draw_project_picker(frame: &mut Frame, area: Rect, app: &App) {
     frame.render_widget(
         Block::default()
             .borders(Borders::ALL)
+            .border_set(rounded_border_set())
             .title("Projects")
             .style(Style::default().bg(c.panel).fg(c.text)),
         popup,
@@ -1082,6 +1089,7 @@ fn draw_due_date_picker(frame: &mut Frame, area: Rect, app: &App) {
     frame.render_widget(
         Block::default()
             .borders(Borders::ALL)
+            .border_set(rounded_border_set())
             .title("Due Date")
             .style(Style::default().bg(c.panel).fg(c.text)),
         popup,
@@ -1405,9 +1413,23 @@ fn due_style(issue: &crate::model::Issue, c: Colors) -> Style {
     }
 }
 
+fn rounded_border_set() -> ratatui::symbols::border::Set<'static> {
+    ratatui::symbols::border::Set {
+        top_left: "╭",
+        top_right: "╮",
+        bottom_left: "╰",
+        bottom_right: "╯",
+        vertical_left: "│",
+        vertical_right: "│",
+        horizontal_top: "─",
+        horizontal_bottom: "─",
+    }
+}
+
 fn styled_block<'a>(c: Colors, title: &'a str) -> Block<'a> {
     Block::default()
         .borders(Borders::ALL)
+        .border_set(rounded_border_set())
         .title(title)
         .style(Style::default().bg(c.panel).fg(c.muted))
 }
@@ -1421,6 +1443,7 @@ fn pane_block<'a>(c: Colors, title: &'a str, active: bool) -> Block<'a> {
 
     Block::default()
         .borders(Borders::ALL)
+        .border_set(rounded_border_set())
         .title(title)
         .style(style)
 }
@@ -1442,7 +1465,7 @@ fn wrapped_text_height(text: &Text<'_>, width: u16) -> u16 {
 }
 
 fn editor_scroll(buffer: &TextBuffer, area: Rect) -> u16 {
-    let inner = Block::default().borders(Borders::ALL).inner(area);
+    let inner = Block::default().borders(Borders::ALL).border_set(rounded_border_set()).inner(area);
     let (scroll, _, _) = editor_viewport(buffer, inner.width, inner.height);
     scroll
 }
