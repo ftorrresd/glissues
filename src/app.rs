@@ -398,7 +398,7 @@ impl App {
 
         match bootstrap.startup {
             StartupProject::Direct { .. } => {
-                app.begin_startup_preload("Loading GitLab data");
+                app.begin_startup_preload("Loading data");
                 if prompt_store {
                     app.store_project_prompt = Some(StoreProjectPromptState {
                         project_url: app.current_project_url.clone(),
@@ -407,7 +407,7 @@ impl App {
                 }
             }
             StartupProject::Stored { .. } => {
-                app.begin_startup_preload("Loading GitLab data");
+                app.begin_startup_preload("Loading data");
             }
         }
 
