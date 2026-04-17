@@ -592,13 +592,6 @@ impl App {
             .map(|total| format!("{}/{} issues", state.loaded, total))
     }
 
-    pub fn spinner_frame(&self) -> &'static str {
-        self.loading
-            .as_ref()
-            .map(|loading| SPINNER_FRAMES[loading.spinner_frame % SPINNER_FRAMES.len()])
-            .unwrap_or(" ")
-    }
-
     pub fn spinner_index(&self) -> usize {
         self.loading
             .as_ref()
