@@ -1198,6 +1198,7 @@ fn draw_loading(frame: &mut Frame, area: Rect, app: &App) {
             &progress_bar,
             Style::default().fg(c.accent),
         )]),
+        Line::from(vec![Span::styled(&detail, Style::default().fg(c.muted))]),
         Line::default(),
         Line::from(vec![Span::styled(
             message,
