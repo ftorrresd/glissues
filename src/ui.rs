@@ -125,13 +125,28 @@ fn draw_header(frame: &mut Frame, area: Rect, app: &App) {
         sep.clone(),
         seg(app.config.project.clone()),
         sep.clone(),
-        seg(format!("open:{}  closed:{}  overdue:{}", app.count_open(), app.count_closed(), app.count_overdue())),
+        seg(format!(
+            "open:{}  closed:{}  overdue:{}",
+            app.count_open(),
+            app.count_closed(),
+            app.count_overdue()
+        )),
         sep.clone(),
         seg(format!("state:{}", app.state_label())),
         sep.clone(),
-        seg(format!("label:{}", app.filters.label.as_deref().unwrap_or("any"))),
+        seg(format!(
+            "label:{}",
+            app.filters.label.as_deref().unwrap_or("any")
+        )),
         sep.clone(),
-        seg(format!("search:{}", if app.filters.search.is_empty() { "off" } else { &app.filters.search })),
+        seg(format!(
+            "search:{}",
+            if app.filters.search.is_empty() {
+                "off"
+            } else {
+                &app.filters.search
+            }
+        )),
         sep.clone(),
         seg(format!("theme:{} ", app.theme.name.display_name())),
     ]);
@@ -148,10 +163,7 @@ fn draw_sidebar(frame: &mut Frame, area: Rect, app: &App) {
     let selected_issue = app.selected_issue().map(|issue| issue.iid);
 
     let lines = vec![
-        Line::from(vec![Span::styled(
-            "Views",
-            Style::default().fg(c.accent),
-        )]),
+        Line::from(vec![Span::styled("Views", Style::default().fg(c.accent))]),
         sidebar_line(c, "All", app.issues.len(), app.state_label() == "all"),
         sidebar_line(c, "Open", app.count_open(), app.state_label() == "open"),
         sidebar_line(
@@ -162,10 +174,7 @@ fn draw_sidebar(frame: &mut Frame, area: Rect, app: &App) {
         ),
         sidebar_line(c, "Overdue", app.count_overdue(), false),
         Line::default(),
-        Line::from(vec![Span::styled(
-            "Scope",
-            Style::default().fg(c.accent),
-        )]),
+        Line::from(vec![Span::styled("Scope", Style::default().fg(c.accent))]),
         Line::from(vec![
             Span::styled("Label  ", Style::default().fg(c.muted)),
             Span::styled(
@@ -185,10 +194,7 @@ fn draw_sidebar(frame: &mut Frame, area: Rect, app: &App) {
             ),
         ]),
         Line::default(),
-        Line::from(vec![Span::styled(
-            "Agenda",
-            Style::default().fg(c.accent),
-        )]),
+        Line::from(vec![Span::styled("Agenda", Style::default().fg(c.accent))]),
         Line::from(vec![
             Span::styled("Today  ", Style::default().fg(c.muted)),
             Span::styled(
@@ -278,11 +284,7 @@ fn draw_issue_list(frame: &mut Frame, area: Rect, app: &App) {
 
     let list = List::new(items)
         .block(pane_block(c, "Issues", true))
-        .highlight_style(
-            Style::default()
-                .bg(c.panel_alt)
-                .fg(c.text),
-        )
+        .highlight_style(Style::default().bg(c.panel_alt).fg(c.text))
         .highlight_symbol("▎");
 
     let mut state = ListState::default();
@@ -381,10 +383,7 @@ fn draw_help(frame: &mut Frame, area: Rect, app: &App) {
         Line::from(":              run commands like :refresh or :filter open"),
         Line::from("Ctrl-c         quit instantly"),
         Line::default(),
-        Line::from(Span::styled(
-            "Editors",
-            Style::default().fg(c.accent),
-        )),
+        Line::from(Span::styled("Editors", Style::default().fg(c.accent))),
         Line::from("Typing         always inserts text"),
         Line::from("Esc            close the editor or comment popup"),
         Line::from("Tab            switch between title/body fields"),
@@ -405,7 +404,10 @@ fn draw_issue_view(frame: &mut Frame, area: Rect, app: &mut App) {
     let c = colors(app.theme.palette());
     let popup = centered_rect(86, 88, area);
     let content = issue_text(app, true);
-    let inner = Block::default().borders(Borders::ALL).border_set(rounded_border_set()).inner(popup);
+    let inner = Block::default()
+        .borders(Borders::ALL)
+        .border_set(rounded_border_set())
+        .inner(popup);
     let content_height = wrapped_text_height(&content, inner.width);
     app.sync_issue_view_layout(inner.height, content_height);
 
@@ -428,10 +430,7 @@ fn draw_confirm_delete(frame: &mut Frame, area: Rect, app: &App) {
 
     let popup = centered_rect(56, 28, area);
     let text = Text::from(vec![
-        Line::from(Span::styled(
-            "Delete issue?",
-            Style::default().fg(c.danger),
-        )),
+        Line::from(Span::styled("Delete issue?", Style::default().fg(c.danger))),
         Line::default(),
         Line::from(vec![
             Span::styled(format!("#{} ", confirm.iid), Style::default().fg(c.accent)),
@@ -523,14 +522,20 @@ fn draw_issue_editor(frame: &mut Frame, area: Rect, app: &App) {
 
     match editor.focus {
         EditorField::Title => {
-            let inner = Block::default().borders(Borders::ALL).border_set(rounded_border_set()).inner(sections[0]);
+            let inner = Block::default()
+                .borders(Borders::ALL)
+                .border_set(rounded_border_set())
+                .inner(sections[0]);
             frame.set_cursor_position((
                 inner.x + editor.title.col() as u16,
                 inner.y + editor.title.row() as u16,
             ));
         }
         EditorField::Body => {
-            let inner = Block::default().borders(Borders::ALL).border_set(rounded_border_set()).inner(sections[1]);
+            let inner = Block::default()
+                .borders(Borders::ALL)
+                .border_set(rounded_border_set())
+                .inner(sections[1]);
             let (_, cursor_x, cursor_y) = editor_viewport(&editor.body, inner.width, inner.height);
             frame.set_cursor_position((inner.x + cursor_x, inner.y + cursor_y));
         }
@@ -573,7 +578,10 @@ fn draw_comment_editor(frame: &mut Frame, area: Rect, app: &App) {
         inner[1],
     );
 
-    let cursor = Block::default().borders(Borders::ALL).border_set(rounded_border_set()).inner(inner[0]);
+    let cursor = Block::default()
+        .borders(Borders::ALL)
+        .border_set(rounded_border_set())
+        .inner(inner[0]);
     let (_, cursor_x, cursor_y) = editor_viewport(&editor.body, cursor.width, cursor.height);
     frame.set_cursor_position((cursor.x + cursor_x, cursor.y + cursor_y));
 }
@@ -1134,15 +1142,9 @@ fn draw_loading(frame: &mut Frame, area: Rect, app: &App) {
     let text = Text::from(vec![
         Line::default(),
         Line::from(vec![
-            Span::styled(
-                app.spinner_frame(),
-                Style::default().fg(c.accent),
-            ),
+            Span::styled(app.spinner_frame(), Style::default().fg(c.accent)),
             Span::raw("  "),
-            Span::styled(
-                message,
-                Style::default().fg(c.text),
-            ),
+            Span::styled(message, Style::default().fg(c.text)),
         ]),
         Line::default(),
         Line::from(Span::styled(detail, Style::default().fg(c.muted))),
@@ -1196,15 +1198,9 @@ fn issue_text(app: &App, include_actions: bool) -> Text<'static> {
     if let Some(issue) = app.selected_issue() {
         let mut lines = vec![
             Line::from(vec![
-                Span::styled(
-                    format!("#{}", issue.iid),
-                    Style::default().fg(c.accent),
-                ),
+                Span::styled(format!("#{}", issue.iid), Style::default().fg(c.accent)),
                 Span::raw(" "),
-                Span::styled(
-                    issue.title.clone(),
-                    Style::default().fg(c.text),
-                ),
+                Span::styled(issue.title.clone(), Style::default().fg(c.text)),
             ]),
             Line::from(vec![
                 Span::styled("State  ", Style::default().fg(c.muted)),
@@ -1313,10 +1309,7 @@ fn issue_text(app: &App, include_actions: bool) -> Text<'static> {
                         })
                         .unwrap_or_else(|| String::from("unknown"));
                     lines.push(Line::from(vec![
-                        Span::styled(
-                            author,
-                            Style::default().fg(c.warn),
-                        ),
+                        Span::styled(author, Style::default().fg(c.warn)),
                         Span::raw("  "),
                         Span::styled(
                             format_timestamp(&note.created_at),
@@ -1371,10 +1364,8 @@ fn calendar_text(picker: &DueDatePickerState, c: Colors) -> Text<'static> {
             let date = NaiveDate::from_ymd_opt(picker.month.year(), picker.month.month(), day)
                 .expect("valid calendar date");
             let style = if date == picker.selected {
-                Style::default()
-                    .bg(c.accent)
-                    .fg(c.bg)
-                } else if date == today {
+                Style::default().bg(c.accent).fg(c.bg)
+            } else if date == today {
                 Style::default().fg(c.warn).add_modifier(Modifier::BOLD)
             } else {
                 Style::default().fg(c.text)
@@ -1459,7 +1450,10 @@ fn wrapped_text_height(text: &Text<'_>, width: u16) -> u16 {
 }
 
 fn editor_scroll(buffer: &TextBuffer, area: Rect) -> u16 {
-    let inner = Block::default().borders(Borders::ALL).border_set(rounded_border_set()).inner(area);
+    let inner = Block::default()
+        .borders(Borders::ALL)
+        .border_set(rounded_border_set())
+        .inner(area);
     let (scroll, _, _) = editor_viewport(buffer, inner.width, inner.height);
     scroll
 }
@@ -1515,9 +1509,7 @@ fn centered_rect(percent_x: u16, percent_y: u16, area: Rect) -> Rect {
 
 fn sidebar_line(c: Colors, label: &str, count: usize, active: bool) -> Line<'static> {
     let style = if active {
-        Style::default()
-            .fg(c.text)
-            .bg(c.panel_alt)
+        Style::default().fg(c.text).bg(c.panel_alt)
     } else {
         Style::default().fg(c.text)
     };

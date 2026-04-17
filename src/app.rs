@@ -1447,28 +1447,24 @@ impl App {
                     picker.query.pop();
                 }
             }
-            KeyCode::Char('j') | KeyCode::Down => {
-                match picker.active_pane {
-                    LabelPane::Add => {
-                        let count = picker.filtered_labels(&self.labels).len().max(1);
-                        picker.cursor_add = (picker.cursor_add + 1).min(count - 1);
-                    }
-                    LabelPane::Exclude => {
-                        let count = picker.filtered_exclude_labels().len().max(1);
-                        picker.cursor_exclude = (picker.cursor_exclude + 1).min(count - 1);
-                    }
+            KeyCode::Char('j') | KeyCode::Down => match picker.active_pane {
+                LabelPane::Add => {
+                    let count = picker.filtered_labels(&self.labels).len().max(1);
+                    picker.cursor_add = (picker.cursor_add + 1).min(count - 1);
                 }
-            }
-            KeyCode::Char('k') | KeyCode::Up => {
-                match picker.active_pane {
-                    LabelPane::Add => {
-                        picker.cursor_add = picker.cursor_add.saturating_sub(1);
-                    }
-                    LabelPane::Exclude => {
-                        picker.cursor_exclude = picker.cursor_exclude.saturating_sub(1);
-                    }
+                LabelPane::Exclude => {
+                    let count = picker.filtered_exclude_labels().len().max(1);
+                    picker.cursor_exclude = (picker.cursor_exclude + 1).min(count - 1);
                 }
-            }
+            },
+            KeyCode::Char('k') | KeyCode::Up => match picker.active_pane {
+                LabelPane::Add => {
+                    picker.cursor_add = picker.cursor_add.saturating_sub(1);
+                }
+                LabelPane::Exclude => {
+                    picker.cursor_exclude = picker.cursor_exclude.saturating_sub(1);
+                }
+            },
             KeyCode::Char(' ') => {
                 picker.push_history();
                 match picker.active_pane {
@@ -3189,7 +3185,8 @@ impl LabelPickerState {
     }
 
     pub fn push_history(&mut self) {
-        self.history.push((self.to_add.clone(), self.to_exclude.clone()));
+        self.history
+            .push((self.to_add.clone(), self.to_exclude.clone()));
     }
 
     pub fn undo(&mut self) {
