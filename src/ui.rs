@@ -1194,7 +1194,6 @@ fn draw_loading(frame: &mut Frame, area: Rect, app: &App) {
             Style::default().fg(c.accent_alt),
         )]),
         Line::from(""),
-        Line::from("PROGRESS"),
         Line::from(vec![Span::styled(
             &progress_bar,
             Style::default().fg(c.accent).add_modifier(Modifier::BOLD),
