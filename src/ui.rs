@@ -1134,20 +1134,20 @@ fn draw_due_date_picker(frame: &mut Frame, area: Rect, app: &App) {
 
 fn draw_loading(frame: &mut Frame, area: Rect, app: &App) {
     let c = colors(app.theme.palette());
-    let popup = centered_rect(48, 22, area);
+    let popup = centered_rect(40, 18, area);
 
     let spinner_idx = app.spinner_index();
 
     let animations = [
-        ("  o_o  ", "waking up..."),
-        ("  -_-  ", "focusing..."),
-        ("  O_O  ", "wow!"),
-        ("  o_o  ", "loading..."),
+        ("o_o", "waking up..."),
+        ("-_-", "focusing..."),
+        ("O_O", "wow!"),
+        ("o_o", "loading..."),
     ];
 
     let (face, status) = animations[spinner_idx % animations.len()];
 
-    let message = app.loading_message().unwrap_or("Loading GitLab data");
+    let message = app.loading_message().unwrap_or("Loading data");
     let detail = app
         .loading_progress_label()
         .unwrap_or_else(|| String::from("fetching..."));
@@ -1164,7 +1164,7 @@ fn draw_loading(frame: &mut Frame, area: Rect, app: &App) {
         .and_then(|s| s.parse::<usize>().ok())
         .unwrap_or(1);
 
-    let bar_width = 30;
+    let bar_width = 24;
     let filled = if total > 0 {
         ((progress as f64 / total as f64) * bar_width as f64) as usize
     } else {
@@ -1182,18 +1182,15 @@ fn draw_loading(frame: &mut Frame, area: Rect, app: &App) {
     let lines = vec![
         Line::default(),
         Line::from(vec![Span::styled(
-            "      GLISSUES - GitLab Issues",
+            "GLISSUES",
             Style::default()
                 .fg(c.accent_alt)
                 .add_modifier(Modifier::BOLD),
         )]),
         Line::default(),
+        Line::from(vec![Span::styled(face, Style::default().fg(c.accent))]),
         Line::from(vec![Span::styled(
-            format!("        {}", face),
-            Style::default().fg(c.accent),
-        )]),
-        Line::from(vec![Span::styled(
-            format!("      {}", status),
+            status,
             Style::default().fg(c.accent_alt),
         )]),
         Line::default(),
@@ -1213,7 +1210,9 @@ fn draw_loading(frame: &mut Frame, area: Rect, app: &App) {
 
     frame.render_widget(Clear, popup);
     frame.render_widget(
-        Paragraph::new(text).style(Style::default().bg(c.panel).fg(c.text)),
+        Paragraph::new(text)
+            .alignment(ratatui::layout::Alignment::Center)
+            .style(Style::default().bg(c.panel).fg(c.text)),
         popup,
     );
 }
