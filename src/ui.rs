@@ -1134,7 +1134,7 @@ fn draw_due_date_picker(frame: &mut Frame, area: Rect, app: &App) {
 
 fn draw_loading(frame: &mut Frame, area: Rect, app: &App) {
     let c = colors(app.theme.palette());
-    let popup = centered_rect(40, 18, area);
+    let popup = centered_rect(50, 24, area);
 
     let spinner_idx = app.spinner_index();
 
@@ -1180,31 +1180,32 @@ fn draw_loading(frame: &mut Frame, area: Rect, app: &App) {
     };
 
     let lines = vec![
-        Line::default(),
+        Line::from(""),
         Line::from(vec![Span::styled(
             "GLISSUES",
             Style::default()
                 .fg(c.accent_alt)
                 .add_modifier(Modifier::BOLD),
         )]),
-        Line::default(),
+        Line::from(""),
         Line::from(vec![Span::styled(face, Style::default().fg(c.accent))]),
         Line::from(vec![Span::styled(
             status,
             Style::default().fg(c.accent_alt),
         )]),
-        Line::default(),
+        Line::from(""),
+        Line::from("PROGRESS"),
         Line::from(vec![Span::styled(
             &progress_bar,
-            Style::default().fg(c.accent),
+            Style::default().fg(c.accent).add_modifier(Modifier::BOLD),
         )]),
-        Line::from(vec![Span::styled(&counter, Style::default().fg(c.muted))]),
-        Line::default(),
         Line::from(vec![Span::styled(
-            message,
-            Style::default().fg(c.text).add_modifier(Modifier::BOLD),
+            &counter,
+            Style::default().fg(c.accent).add_modifier(Modifier::BOLD),
         )]),
-        Line::default(),
+        Line::from(""),
+        Line::from(vec![Span::styled(message, Style::default().fg(c.text))]),
+        Line::from(""),
     ];
 
     let text = Text::from(lines);
