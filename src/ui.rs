@@ -1148,36 +1148,36 @@ fn draw_loading(frame: &mut Frame, area: Rect, app: &App) {
     let (face, status) = animations[spinner_idx % animations.len()];
 
     let message = app.loading_message().unwrap_or("Loading data");
-    let detail = app
-        .loading_progress_label()
-        .unwrap_or_else(|| String::from("fetching..."));
 
-    let progress = detail
-        .split('/')
-        .next()
-        .and_then(|s| s.trim().parse::<usize>().ok())
-        .unwrap_or(0);
-    let total = detail
-        .split('/')
-        .nth(1)
-        .and_then(|s| s.trim().split(' ').next())
-        .and_then(|s| s.parse::<usize>().ok())
-        .unwrap_or(1);
+    let (progress_bar, counter) = match app.loading_progress_label() {
+        Some(detail) => {
+            let progress = detail
+                .split('/')
+                .next()
+                .and_then(|s| s.trim().parse::<usize>().ok())
+                .unwrap_or(0);
+            let total = detail
+                .split('/')
+                .nth(1)
+                .and_then(|s| s.trim().split(' ').next())
+                .and_then(|s| s.parse::<usize>().ok())
+                .unwrap_or(1);
 
-    let bar_width = 24;
-    let filled = if total > 0 {
-        ((progress as f64 / total as f64) * bar_width as f64) as usize
-    } else {
-        0
+            let bar_width = 24;
+            let filled = if total > 0 {
+                ((progress as f64 / total as f64) * bar_width as f64) as usize
+            } else {
+                0
+            };
+
+            let bar = format!("[{}{}]", "=".repeat(filled), " ".repeat(bar_width - filled),);
+            (bar, detail)
+        }
+        None => (
+            String::from("[                        ]"),
+            String::from("connecting..."),
+        ),
     };
-
-    let progress_bar = format!(
-        "[{}{}] {}/{}",
-        "=".repeat(filled),
-        " ".repeat(bar_width - filled),
-        progress,
-        total
-    );
 
     let lines = vec![
         Line::default(),
@@ -1198,7 +1198,7 @@ fn draw_loading(frame: &mut Frame, area: Rect, app: &App) {
             &progress_bar,
             Style::default().fg(c.accent),
         )]),
-        Line::from(vec![Span::styled(&detail, Style::default().fg(c.muted))]),
+        Line::from(vec![Span::styled(&counter, Style::default().fg(c.muted))]),
         Line::default(),
         Line::from(vec![Span::styled(
             message,
