@@ -1212,6 +1212,7 @@ fn draw_loading(frame: &mut Frame, area: Rect, app: &App) {
     frame.render_widget(
         Paragraph::new(text)
             .alignment(ratatui::layout::Alignment::Center)
+            .block(pane_block(c, "", true))
             .style(Style::default().bg(c.panel).fg(c.text)),
         popup,
     );
