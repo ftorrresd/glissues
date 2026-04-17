@@ -1134,26 +1134,64 @@ fn draw_due_date_picker(frame: &mut Frame, area: Rect, app: &App) {
 
 fn draw_loading(frame: &mut Frame, area: Rect, app: &App) {
     let c = colors(app.theme.palette());
-    let popup = centered_rect(34, 16, area);
+    let popup = centered_rect(50, 28, area);
     let message = app.loading_message().unwrap_or("Loading GitLab data");
     let detail = app
         .loading_progress_label()
         .unwrap_or_else(|| String::from("Please wait..."));
-    let text = Text::from(vec![
+
+    let lines = vec![
+        Line::default(),
+        Line::default(),
+        Line::from(vec![Span::styled(
+            "  ╔═════════════════════════════════════════════╗  ",
+            Style::default().fg(c.accent),
+        )]),
+        Line::from(vec![
+            Span::styled("  ║", Style::default().fg(c.accent)),
+            Span::styled(
+                "            ✨ glissues ✨            ",
+                Style::default()
+                    .fg(c.accent_alt)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled("║  ", Style::default().fg(c.accent)),
+        ]),
+        Line::from(vec![
+            Span::styled("  ║", Style::default().fg(c.accent)),
+            Span::styled(
+                "   Fetching issues from GitLab   ",
+                Style::default().fg(c.text),
+            ),
+            Span::styled("║  ", Style::default().fg(c.accent)),
+        ]),
+        Line::from(vec![Span::styled(
+            "  ╚═════════════════════════════════════════════╝  ",
+            Style::default().fg(c.accent),
+        )]),
         Line::default(),
         Line::from(vec![
-            Span::styled(app.spinner_frame(), Style::default().fg(c.accent)),
             Span::raw("  "),
-            Span::styled(message, Style::default().fg(c.text)),
+            Span::styled(app.spinner_frame(), Style::default().fg(c.accent_alt)),
+            Span::raw("  "),
+            Span::styled(
+                message,
+                Style::default().fg(c.text).add_modifier(Modifier::BOLD),
+            ),
         ]),
         Line::default(),
-        Line::from(Span::styled(detail, Style::default().fg(c.muted))),
-    ]);
+        Line::from(vec![
+            Span::raw("  "),
+            Span::styled(detail, Style::default().fg(c.accent)),
+        ]),
+        Line::default(),
+    ];
+
+    let text = Text::from(lines);
 
     frame.render_widget(Clear, popup);
     frame.render_widget(
         Paragraph::new(text)
-            .block(pane_block(c, "Loading", true))
             .style(Style::default().bg(c.panel).fg(c.text))
             .wrap(Wrap { trim: false }),
         popup,
