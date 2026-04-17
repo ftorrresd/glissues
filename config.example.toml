@@ -1,1 +1,18 @@
+# glissues configuration
+# Save this as ~/.config/glissues/config.toml (or use -c flag to specify path)
+
+# GitLab instance URL
+gitlab_url = "https://gitlab.com"
+
+# Project path (group/subgroup/project format)
+project = "your-group/your-project"
+
+# Project URL (used for lookups)
+project_url = "https://gitlab.com/your-group/your-project"
+
+# GitLab personal access token (create at: https://gitlab.com/profile/personal_access_tokens)
+# Scopes needed: api, read_api
+private_token = "glpat-xxxxxxxxxxxxx"
+
+# UI theme (options: rose-pine, dracula, nord, solarized-dark, solarized-light, tokyonight)
 theme = "rose-pine"
