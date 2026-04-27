@@ -125,8 +125,18 @@ pub struct AlertState {
 #[derive(Debug, Clone, Copy)]
 pub enum MentionTarget {
     IssueTitle,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ExternalEditTarget {
     IssueBody,
     CommentBody,
+}
+
+#[derive(Debug, Clone)]
+pub struct ExternalEditRequest {
+    pub initial_content: String,
+    pub target: ExternalEditTarget,
 }
 
 #[derive(Debug, Clone)]
@@ -295,6 +305,7 @@ pub struct App {
     loading: Option<LoadingState>,
     pending_action: Option<PendingActionState>,
     undo_history: Vec<Issue>,
+    pub pending_external_edit: Option<ExternalEditRequest>,
 }
 
 impl App {
@@ -379,6 +390,7 @@ impl App {
             loading: None,
             pending_action: None,
             undo_history: Vec::new(),
+            pending_external_edit: None,
         };
 
         if !app
@@ -604,7 +616,34 @@ impl App {
     }
 
     pub fn is_text_editing(&self) -> bool {
-        matches!(self.mode, Mode::IssueEditor | Mode::CommentEditor)
+        matches!(self.mode, Mode::IssueEditor)
+            && self
+                .issue_editor
+                .as_ref()
+                .map(|e| matches!(e.focus, EditorField::Title))
+                .unwrap_or(false)
+    }
+
+    pub fn take_pending_external_edit(&mut self) -> Option<ExternalEditRequest> {
+        self.pending_external_edit.take()
+    }
+
+    pub fn on_external_edit_complete(&mut self, content: String, target: ExternalEditTarget) {
+        match target {
+            ExternalEditTarget::IssueBody => {
+                if let Some(editor) = self.issue_editor.as_mut() {
+                    editor.body = TextBuffer::from_text(&content);
+                    editor.focus = EditorField::Body;
+                }
+                self.mode = Mode::IssueEditor;
+            }
+            ExternalEditTarget::CommentBody => {
+                if let Some(editor) = self.comment_editor.as_mut() {
+                    editor.body = TextBuffer::from_text(&content);
+                }
+                self.mode = Mode::CommentEditor;
+            }
+        }
     }
 
     pub fn has_mention_picker(&self) -> bool {
@@ -947,6 +986,10 @@ impl App {
                 self.pending_g = false;
                 self.open_label_filter();
             }
+            KeyCode::Char('y') => {
+                self.pending_g = false;
+                self.copy_issue_url();
+            }
             _ => self.handle_list_key(key)?,
         }
 
@@ -1097,6 +1140,10 @@ impl App {
             KeyCode::Char('G') => {
                 self.issue_view_scroll = self.max_issue_view_scroll();
                 self.pending_g = false;
+            }
+            KeyCode::Char('y') => {
+                self.pending_g = false;
+                self.copy_issue_url();
             }
             _ => self.pending_g = false,
         }
@@ -1328,57 +1375,77 @@ impl App {
             return self.handle_mention_picker(key);
         }
 
-        let Some(editor) = self.issue_editor.as_mut() else {
+        if self.issue_editor.is_none() {
             self.mode = self.return_mode;
             return Ok(());
-        };
+        }
 
         if key.modifiers.contains(KeyModifiers::CONTROL) && matches!(key.code, KeyCode::Char('s')) {
             return self.save_issue_editor();
         }
 
-        match key.code {
-            KeyCode::Esc => {
+        let focus = self.issue_editor.as_ref().unwrap().focus;
+
+        match (key.code, focus) {
+            (KeyCode::Esc, _) => {
                 self.restore_return_mode();
                 self.status_line = String::from("issue draft kept locally");
             }
-            KeyCode::Tab => editor.focus = next_field(editor.focus),
-            KeyCode::BackTab => editor.focus = previous_field(editor.focus),
-            KeyCode::Enter if matches!(editor.focus, EditorField::Title) => {
-                editor.focus = EditorField::Body;
+            (KeyCode::Tab | KeyCode::Enter, EditorField::Title) => {
+                let content = self.issue_editor.as_ref().unwrap().body.to_text();
+                self.issue_editor.as_mut().unwrap().focus = EditorField::Body;
+                self.pending_external_edit = Some(ExternalEditRequest {
+                    initial_content: content,
+                    target: ExternalEditTarget::IssueBody,
+                });
             }
-            KeyCode::Char('#')
+            (KeyCode::Tab | KeyCode::BackTab, EditorField::Body) => {
+                self.issue_editor.as_mut().unwrap().focus = EditorField::Title;
+            }
+            (KeyCode::Enter, EditorField::Body) => {
+                let content = self.issue_editor.as_ref().unwrap().body.to_text();
+                self.pending_external_edit = Some(ExternalEditRequest {
+                    initial_content: content,
+                    target: ExternalEditTarget::IssueBody,
+                });
+            }
+            (KeyCode::Char('e'), EditorField::Body)
                 if !key
                     .modifiers
                     .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
             {
-                let target = match editor.focus {
-                    EditorField::Title => MentionTarget::IssueTitle,
-                    EditorField::Body => MentionTarget::IssueBody,
-                };
-                let buffer = active_issue_buffer(editor);
-                buffer.insert_char('#');
-                self.open_mention_picker(target);
+                let content = self.issue_editor.as_ref().unwrap().body.to_text();
+                self.pending_external_edit = Some(ExternalEditRequest {
+                    initial_content: content,
+                    target: ExternalEditTarget::IssueBody,
+                });
             }
-            _ => {
-                let multiline = matches!(editor.focus, EditorField::Body);
-                let buffer = active_issue_buffer(editor);
-                buffer.handle_insert_key(key, multiline);
+            (KeyCode::Char('#'), EditorField::Title)
+                if !key
+                    .modifiers
+                    .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
+            {
+                self.issue_editor.as_mut().unwrap().title.insert_char('#');
+                self.open_mention_picker(MentionTarget::IssueTitle);
             }
+            (_, EditorField::Title) => {
+                self.issue_editor
+                    .as_mut()
+                    .unwrap()
+                    .title
+                    .handle_insert_key(key, false);
+            }
+            _ => {}
         }
 
         Ok(())
     }
 
     fn handle_comment_editor_mode(&mut self, key: KeyEvent) -> Result<()> {
-        if self.mention_picker.is_some() {
-            return self.handle_mention_picker(key);
-        }
-
-        let Some(editor) = self.comment_editor.as_mut() else {
+        if self.comment_editor.is_none() {
             self.mode = self.return_mode;
             return Ok(());
-        };
+        }
 
         if key.modifiers.contains(KeyModifiers::CONTROL) && matches!(key.code, KeyCode::Char('s')) {
             return self.save_comment_editor();
@@ -1389,17 +1456,18 @@ impl App {
                 self.restore_return_mode();
                 self.status_line = String::from("comment draft kept locally");
             }
-            KeyCode::Char('#')
+            KeyCode::Enter
                 if !key
                     .modifiers
                     .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
             {
-                editor.body.insert_char('#');
-                self.open_mention_picker(MentionTarget::CommentBody);
+                let content = self.comment_editor.as_ref().unwrap().body.to_text();
+                self.pending_external_edit = Some(ExternalEditRequest {
+                    initial_content: content,
+                    target: ExternalEditTarget::CommentBody,
+                });
             }
-            _ => {
-                editor.body.handle_insert_key(key, true);
-            }
+            _ => {}
         }
 
         Ok(())
@@ -2348,6 +2416,23 @@ impl App {
         Ok(())
     }
 
+    fn copy_issue_url(&mut self) {
+        let Some(url) = self.selected_issue().map(|i| i.web_url.clone()) else {
+            self.status_line = String::from("no issue selected");
+            return;
+        };
+        if url.is_empty() {
+            self.status_line = String::from("issue has no URL");
+            return;
+        }
+        if copy_to_clipboard(&url) {
+            self.status_line = format!("copied: {}", url);
+        } else {
+            self.status_line =
+                String::from("clipboard unavailable (install wl-copy, xclip, or xsel)");
+        }
+    }
+
     fn undo_issue_state(&mut self) -> Result<()> {
         if let Some(previous_issue) = self.undo_history.pop() {
             self.replace_issue(previous_issue);
@@ -2510,22 +2595,30 @@ impl App {
         };
 
         self.capture_return_mode();
-        if self
+
+        let initial_content = if self
             .comment_editor
             .as_ref()
             .map(|draft| draft.target_iid == target_iid)
             .unwrap_or(false)
         {
-            self.mode = Mode::CommentEditor;
-            return;
-        }
+            self.comment_editor
+                .as_ref()
+                .map(|d| d.body.to_text())
+                .unwrap_or_default()
+        } else {
+            self.mention_picker = None;
+            self.comment_editor = Some(CommentEditorState {
+                target_iid,
+                body: TextBuffer::new(),
+            });
+            String::new()
+        };
 
-        self.mention_picker = None;
-        self.comment_editor = Some(CommentEditorState {
-            target_iid,
-            body: TextBuffer::new(),
+        self.pending_external_edit = Some(ExternalEditRequest {
+            initial_content,
+            target: ExternalEditTarget::CommentBody,
         });
-        self.mode = Mode::CommentEditor;
     }
 
     fn save_comment_editor(&mut self) -> Result<()> {
@@ -3114,10 +3207,6 @@ impl App {
     fn mention_target_buffer_mut(&mut self, target: MentionTarget) -> Option<&mut TextBuffer> {
         match target {
             MentionTarget::IssueTitle => self.issue_editor.as_mut().map(|editor| &mut editor.title),
-            MentionTarget::IssueBody => self.issue_editor.as_mut().map(|editor| &mut editor.body),
-            MentionTarget::CommentBody => {
-                self.comment_editor.as_mut().map(|editor| &mut editor.body)
-            }
         }
     }
 }
@@ -3225,22 +3314,29 @@ impl SelectorState {
     }
 }
 
-fn active_issue_buffer(editor: &mut IssueEditorState) -> &mut TextBuffer {
-    match editor.focus {
-        EditorField::Title => &mut editor.title,
-        EditorField::Body => &mut editor.body,
+fn copy_to_clipboard(text: &str) -> bool {
+    let tools: &[(&str, &[&str])] = &[
+        ("wl-copy", &[]),
+        ("xclip", &["-selection", "clipboard"]),
+        ("xsel", &["--clipboard", "--input"]),
+    ];
+    for (cmd, args) in tools {
+        if let Ok(mut child) = std::process::Command::new(cmd)
+            .args(*args)
+            .stdin(std::process::Stdio::piped())
+            .spawn()
+        {
+            if let Some(stdin) = child.stdin.as_mut() {
+                use std::io::Write;
+                if stdin.write_all(text.as_bytes()).is_ok() {
+                    if child.wait().map(|s| s.success()).unwrap_or(false) {
+                        return true;
+                    }
+                }
+            }
+        }
     }
-}
-
-fn next_field(field: EditorField) -> EditorField {
-    match field {
-        EditorField::Title => EditorField::Body,
-        EditorField::Body => EditorField::Title,
-    }
-}
-
-fn previous_field(field: EditorField) -> EditorField {
-    next_field(field)
+    false
 }
 
 fn rebuild_label_catalog_for(issues: &[Issue], labels: &mut Vec<String>) {

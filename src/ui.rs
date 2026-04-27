@@ -7,7 +7,6 @@ use ratatui::widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragra
 use ratatui_themes::{ThemePalette, ThemePicker};
 
 use crate::app::{App, DueDatePickerState, EditorField, Mode, format_timestamp, parse_due_date};
-use crate::editor::TextBuffer;
 use crate::markdown::render_markdown;
 
 #[derive(Clone, Copy)]
@@ -374,19 +373,17 @@ fn draw_help(frame: &mut Frame, area: Rect, app: &App) {
         Line::from("d              open the due date picker"),
         Line::from("x              close or reopen the selected issue"),
         Line::from("D              delete the selected issue after confirmation"),
+        Line::from("y              copy the issue URL to clipboard"),
         Line::from(
-            "Inside popup   e edit, c comment, a labels, b/B blockers, d due, x close/reopen, D delete",
-        ),
-        Line::from(
-            "Inside editors type # to mention an issue, Enter to insert #iid, or Esc to skip",
+            "Inside popup   e edit, c comment, a labels, b/B blockers, d due, x close/reopen, D delete, y url",
         ),
         Line::from(":              run commands like :refresh or :filter open"),
         Line::from("Ctrl-c         quit instantly"),
         Line::default(),
         Line::from(Span::styled("Editors", Style::default().fg(c.accent))),
-        Line::from("Typing         always inserts text"),
-        Line::from("Esc            close the editor or comment popup"),
-        Line::from("Tab            switch between title/body fields"),
+        Line::from("Title          edit inline; Tab or Enter opens body in external editor"),
+        Line::from("Body           opens in $GIT_EDITOR / $VISUAL / $EDITOR; Enter to re-open"),
+        Line::from("Esc            close draft (kept in memory)"),
         Line::from("Ctrl-s         save changes"),
     ]);
 
@@ -506,39 +503,46 @@ fn draw_issue_editor(frame: &mut Frame, area: Rect, app: &App) {
             .style(title_style),
         sections[0],
     );
+    let body_hint = if editor.body.to_text().trim().is_empty() {
+        "(empty — press Enter or Tab to open in editor)"
+    } else {
+        ""
+    };
     frame.render_widget(
-        Paragraph::new(editor.body.to_text())
-            .block(styled_block(c, "Body (Markdown)"))
-            .style(body_style)
-            .wrap(Wrap { trim: false })
-            .scroll((editor_scroll(&editor.body, sections[1]), 0)),
+        Paragraph::new(if body_hint.is_empty() {
+            editor.body.to_text()
+        } else {
+            body_hint.to_string()
+        })
+        .block(styled_block(c, "Body (Markdown)"))
+        .style(if body_hint.is_empty() {
+            body_style
+        } else {
+            Style::default().fg(c.muted).bg(c.panel)
+        })
+        .wrap(Wrap { trim: false }),
         sections[1],
     );
+
+    let hint = if matches!(editor.focus, EditorField::Title) {
+        "Esc keep draft  Tab/Enter open body in editor  Ctrl-s save  # mention"
+    } else {
+        "Esc keep draft  Enter/e re-open editor  Tab back to title  Ctrl-s save"
+    };
     frame.render_widget(
-        Paragraph::new("Esc close draft  Tab next field  Ctrl-s save  # mention issue")
-            .style(Style::default().fg(c.muted).bg(c.panel)),
+        Paragraph::new(hint).style(Style::default().fg(c.muted).bg(c.panel)),
         sections[2],
     );
 
-    match editor.focus {
-        EditorField::Title => {
-            let inner = Block::default()
-                .borders(Borders::ALL)
-                .border_set(rounded_border_set())
-                .inner(sections[0]);
-            frame.set_cursor_position((
-                inner.x + editor.title.col() as u16,
-                inner.y + editor.title.row() as u16,
-            ));
-        }
-        EditorField::Body => {
-            let inner = Block::default()
-                .borders(Borders::ALL)
-                .border_set(rounded_border_set())
-                .inner(sections[1]);
-            let (_, cursor_x, cursor_y) = editor_viewport(&editor.body, inner.width, inner.height);
-            frame.set_cursor_position((inner.x + cursor_x, inner.y + cursor_y));
-        }
+    if matches!(editor.focus, EditorField::Title) {
+        let inner = Block::default()
+            .borders(Borders::ALL)
+            .border_set(rounded_border_set())
+            .inner(sections[0]);
+        frame.set_cursor_position((
+            inner.x + editor.title.col() as u16,
+            inner.y + editor.title.row() as u16,
+        ));
     }
 }
 
@@ -564,26 +568,27 @@ fn draw_comment_editor(frame: &mut Frame, area: Rect, app: &App) {
             .style(Style::default().bg(c.panel).fg(c.text)),
         popup,
     );
+    let body_text = editor.body.to_text();
+    let (body_content, body_style) = if body_text.trim().is_empty() {
+        (
+            "(empty — press Enter to open in editor)".to_string(),
+            Style::default().bg(c.panel_alt).fg(c.muted),
+        )
+    } else {
+        (body_text, Style::default().bg(c.panel_alt).fg(c.text))
+    };
     frame.render_widget(
-        Paragraph::new(editor.body.to_text())
+        Paragraph::new(body_content)
             .block(styled_block(c, "Body"))
-            .style(Style::default().bg(c.panel_alt).fg(c.text))
-            .wrap(Wrap { trim: false })
-            .scroll((editor_scroll(&editor.body, inner[0]), 0)),
+            .style(body_style)
+            .wrap(Wrap { trim: false }),
         inner[0],
     );
     frame.render_widget(
-        Paragraph::new("Esc close draft  Ctrl-s save  # mention issue")
+        Paragraph::new("Esc keep draft  Enter re-open editor  Ctrl-s save")
             .style(Style::default().fg(c.muted).bg(c.panel)),
         inner[1],
     );
-
-    let cursor = Block::default()
-        .borders(Borders::ALL)
-        .border_set(rounded_border_set())
-        .inner(inner[0]);
-    let (_, cursor_x, cursor_y) = editor_viewport(&editor.body, cursor.width, cursor.height);
-    frame.set_cursor_position((cursor.x + cursor_x, cursor.y + cursor_y));
 }
 
 fn draw_label_editor(frame: &mut Frame, area: Rect, app: &App) {
@@ -1506,44 +1511,6 @@ fn wrapped_text_height(text: &Text<'_>, width: u16) -> u16 {
             wrapped as u16
         })
         .sum()
-}
-
-fn editor_scroll(buffer: &TextBuffer, area: Rect) -> u16 {
-    let inner = Block::default()
-        .borders(Borders::ALL)
-        .border_set(rounded_border_set())
-        .inner(area);
-    let (scroll, _, _) = editor_viewport(buffer, inner.width, inner.height);
-    scroll
-}
-
-fn editor_viewport(buffer: &TextBuffer, width: u16, height: u16) -> (u16, u16, u16) {
-    let width = width.max(1) as usize;
-    let height = height.max(1) as usize;
-
-    let mut visual_row = 0usize;
-    for line in buffer.lines().iter().take(buffer.row()) {
-        visual_row += wrapped_line_rows(line, width);
-    }
-
-    let current_line = &buffer.lines()[buffer.row()];
-    let current_col = buffer.col().min(current_line.chars().count());
-    visual_row += current_col / width;
-    let visual_col = (current_col % width) as u16;
-
-    let scroll = visual_row.saturating_sub(height.saturating_sub(1));
-    let cursor_y = (visual_row - scroll) as u16;
-
-    (scroll as u16, visual_col, cursor_y)
-}
-
-fn wrapped_line_rows(line: &str, width: usize) -> usize {
-    let chars = line.chars().count();
-    if chars == 0 {
-        1
-    } else {
-        ((chars - 1) / width) + 1
-    }
 }
 
 fn centered_rect(percent_x: u16, percent_y: u16, area: Rect) -> Rect {

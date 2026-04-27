@@ -32,10 +32,6 @@ impl TextBuffer {
         self.lines.join("\n")
     }
 
-    pub fn lines(&self) -> &[String] {
-        &self.lines
-    }
-
     pub fn row(&self) -> usize {
         self.row
     }
@@ -83,6 +79,35 @@ impl TextBuffer {
 
     pub fn move_line_end(&mut self) {
         self.col = line_char_len(&self.lines[self.row]);
+    }
+
+    pub fn move_word_left(&mut self) {
+        let chars: Vec<char> = self.lines[self.row].chars().collect();
+        let mut col = self.col;
+        // skip whitespace to the left
+        while col > 0 && chars[col - 1].is_whitespace() {
+            col -= 1;
+        }
+        // skip non-whitespace to the left
+        while col > 0 && !chars[col - 1].is_whitespace() {
+            col -= 1;
+        }
+        self.col = col;
+    }
+
+    pub fn move_word_right(&mut self) {
+        let chars: Vec<char> = self.lines[self.row].chars().collect();
+        let len = chars.len();
+        let mut col = self.col;
+        // skip non-whitespace to the right
+        while col < len && !chars[col].is_whitespace() {
+            col += 1;
+        }
+        // skip whitespace to the right
+        while col < len && chars[col].is_whitespace() {
+            col += 1;
+        }
+        self.col = col;
     }
 
     pub fn insert_char(&mut self, ch: char) {
@@ -146,6 +171,14 @@ impl TextBuffer {
             }
             KeyCode::Delete => {
                 self.delete();
+                true
+            }
+            KeyCode::Left if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                self.move_word_left();
+                true
+            }
+            KeyCode::Right if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                self.move_word_right();
                 true
             }
             KeyCode::Left => {
@@ -249,5 +282,47 @@ mod tests {
         buffer.insert_newline();
 
         assert_eq!(buffer.to_text(), "aç\não");
+    }
+
+    #[test]
+    fn move_word_right_jumps_to_next_word() {
+        let mut buffer = TextBuffer::from_text("hello world foo");
+        buffer.move_word_right();
+        assert_eq!(buffer.col(), 6); // start of "world"
+        buffer.move_word_right();
+        assert_eq!(buffer.col(), 12); // start of "foo"
+        buffer.move_word_right();
+        assert_eq!(buffer.col(), 15); // end of line
+    }
+
+    #[test]
+    fn move_word_left_jumps_to_prev_word() {
+        let mut buffer = TextBuffer::from_text("hello world foo");
+        buffer.move_line_end();
+        buffer.move_word_left();
+        assert_eq!(buffer.col(), 12); // start of "foo"
+        buffer.move_word_left();
+        assert_eq!(buffer.col(), 6); // start of "world"
+        buffer.move_word_left();
+        assert_eq!(buffer.col(), 0); // start of "hello"
+    }
+
+    #[test]
+    fn move_word_right_from_middle_of_word() {
+        let mut buffer = TextBuffer::from_text("hello world");
+        buffer.move_right();
+        buffer.move_right(); // col = 2, middle of "hello"
+        buffer.move_word_right();
+        assert_eq!(buffer.col(), 6); // start of "world"
+    }
+
+    #[test]
+    fn move_word_left_from_middle_of_word() {
+        let mut buffer = TextBuffer::from_text("hello world");
+        buffer.move_line_end();
+        buffer.move_left();
+        buffer.move_left(); // col = 9, middle of "world"
+        buffer.move_word_left();
+        assert_eq!(buffer.col(), 6); // start of "world"
     }
 }

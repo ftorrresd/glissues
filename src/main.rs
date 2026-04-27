@@ -36,6 +36,62 @@ fn main() -> Result<()> {
     result
 }
 
+fn get_git_editor() -> String {
+    if let Ok(e) = std::env::var("GIT_EDITOR") {
+        if !e.trim().is_empty() {
+            return e;
+        }
+    }
+    if let Ok(output) = std::process::Command::new("git")
+        .args(["config", "core.editor"])
+        .output()
+    {
+        let e = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        if !e.is_empty() {
+            return e;
+        }
+    }
+    if let Ok(e) = std::env::var("VISUAL") {
+        if !e.trim().is_empty() {
+            return e;
+        }
+    }
+    if let Ok(e) = std::env::var("EDITOR") {
+        if !e.trim().is_empty() {
+            return e;
+        }
+    }
+    String::from("vi")
+}
+
+fn launch_external_editor(content: &str) -> Result<String> {
+    let editor = get_git_editor();
+    let tmp_path = std::env::temp_dir().join(format!("glissues_{}.md", std::process::id()));
+    std::fs::write(&tmp_path, content)?;
+    std::process::Command::new("sh")
+        .arg("-c")
+        .arg(format!("{} \"$1\"", editor))
+        .arg("glissues")
+        .arg(&tmp_path)
+        .status()?;
+    let result = std::fs::read_to_string(&tmp_path)?;
+    let _ = std::fs::remove_file(&tmp_path);
+    Ok(result)
+}
+
+fn open_in_external_editor(
+    terminal: &mut Terminal<CrosstermBackend<Stdout>>,
+    content: &str,
+) -> Result<String> {
+    disable_raw_mode()?;
+    execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
+    let editor_result = launch_external_editor(content);
+    enable_raw_mode()?;
+    execute!(terminal.backend_mut(), EnterAlternateScreen)?;
+    terminal.clear()?;
+    editor_result
+}
+
 fn setup_terminal() -> Result<Terminal<CrosstermBackend<Stdout>>> {
     enable_raw_mode()?;
     let mut stdout = io::stdout();
@@ -81,6 +137,20 @@ fn run_app(terminal: &mut Terminal<CrosstermBackend<Stdout>>, app: &mut App) -> 
 
                     if let Err(error) = app.on_key(key) {
                         app.show_error(format!("{error:#}"));
+                    }
+
+                    if let Some(edit_request) = app.take_pending_external_edit() {
+                        let content = match open_in_external_editor(
+                            terminal,
+                            &edit_request.initial_content,
+                        ) {
+                            Ok(c) => c,
+                            Err(e) => {
+                                app.show_error(format!("failed to open external editor: {e:#}"));
+                                edit_request.initial_content.clone()
+                            }
+                        };
+                        app.on_external_edit_complete(content, edit_request.target);
                     }
                 }
                 Event::Mouse(_) => {}
