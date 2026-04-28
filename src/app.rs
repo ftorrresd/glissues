@@ -92,6 +92,7 @@ pub struct LabelPickerState {
     pub cursor_exclude: usize,
     pub active_pane: LabelPane,
     pub history: Vec<(BTreeSet<String>, BTreeSet<String>)>,
+    pub rename_buffer: Option<(String, TextBuffer)>,
 }
 
 #[derive(Debug, Clone)]
@@ -258,6 +259,11 @@ enum PendingActionResult {
         label: String,
         message: String,
     },
+    LabelRenamed {
+        old_name: String,
+        new_name: String,
+        message: String,
+    },
 }
 
 pub struct App {
@@ -306,6 +312,9 @@ pub struct App {
     pending_action: Option<PendingActionState>,
     undo_history: Vec<Issue>,
     pub pending_external_edit: Option<ExternalEditRequest>,
+    update_check_receiver: Option<Receiver<Option<String>>>,
+    pub update_available: Option<String>,
+    pub should_restart: bool,
 }
 
 impl App {
@@ -391,6 +400,9 @@ impl App {
             pending_action: None,
             undo_history: Vec::new(),
             pending_external_edit: None,
+            update_check_receiver: None,
+            update_available: None,
+            should_restart: false,
         };
 
         if !app
@@ -422,6 +434,8 @@ impl App {
                 app.begin_startup_preload("Loading data");
             }
         }
+
+        app.update_check_receiver = Some(spawn_update_check());
 
         Ok(app)
     }
@@ -585,6 +599,19 @@ impl App {
                 self.finish_pending_action(pending_action, result);
             }
         }
+
+        if let Some(rx) = self.update_check_receiver.as_ref() {
+            match rx.try_recv() {
+                Ok(Some(version)) => {
+                    self.update_available = Some(version);
+                    self.update_check_receiver = None;
+                }
+                Ok(None) | Err(TryRecvError::Disconnected) => {
+                    self.update_check_receiver = None;
+                }
+                Err(TryRecvError::Empty) => {}
+            }
+        }
     }
 
     pub fn is_loading(&self) -> bool {
@@ -733,6 +760,20 @@ impl App {
     }
 
     pub fn on_key(&mut self, key: KeyEvent) -> Result<()> {
+        if self.update_available.is_some() {
+            match key.code {
+                KeyCode::Char('y') => {
+                    self.should_restart = true;
+                    self.should_quit = true;
+                }
+                KeyCode::Char('n') | KeyCode::Esc => {
+                    self.update_available = None;
+                }
+                _ => {}
+            }
+            return Ok(());
+        }
+
         if self.alert.is_some() {
             match key.code {
                 KeyCode::Esc | KeyCode::Enter | KeyCode::Char('q') => self.alert = None,
@@ -1479,6 +1520,35 @@ impl App {
             return Ok(());
         };
 
+        if picker.rename_buffer.is_some() {
+            match key.code {
+                KeyCode::Esc => {
+                    picker.rename_buffer = None;
+                }
+                KeyCode::Enter => {
+                    let new_name = picker
+                        .rename_buffer
+                        .as_ref()
+                        .map(|(_, buf)| buf.to_text().trim().to_string())
+                        .unwrap_or_default();
+                    let old_name = picker
+                        .rename_buffer
+                        .take()
+                        .map(|(name, _)| name)
+                        .unwrap_or_default();
+                    if !new_name.is_empty() && new_name != old_name {
+                        return self.rename_label_in_project(&old_name, &new_name);
+                    }
+                }
+                _ => {
+                    if let Some((_, buf)) = picker.rename_buffer.as_mut() {
+                        buf.handle_insert_key(key, false);
+                    }
+                }
+            }
+            return Ok(());
+        }
+
         match key.code {
             KeyCode::Esc => {
                 self.label_picker = None;
@@ -1560,6 +1630,17 @@ impl App {
             }
             KeyCode::Char('u') if picker.query.is_empty() => {
                 picker.undo();
+            }
+            KeyCode::Char('r') if picker.query.is_empty() => {
+                let label = match picker.active_pane {
+                    LabelPane::Add => picker.current_choice_add(&self.labels),
+                    LabelPane::Exclude => picker.current_choice_exclude(),
+                };
+                if let Some(label) = label {
+                    let mut buf = TextBuffer::from_text(&label);
+                    buf.move_line_end();
+                    picker.rename_buffer = Some((label, buf));
+                }
             }
             KeyCode::Char('d') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                 if let Some(label) = match picker.active_pane {
@@ -2680,6 +2761,7 @@ impl App {
             cursor_exclude: 0,
             active_pane: LabelPane::Add,
             history: Vec::new(),
+            rename_buffer: None,
         });
         self.mode = Mode::LabelEditor;
     }
@@ -2747,6 +2829,32 @@ impl App {
                 Ok(PendingActionResult::LabelDeleted {
                     label: label.clone(),
                     message: format!("label '{}' deleted", label),
+                })
+            },
+        );
+
+        Ok(())
+    }
+
+    fn rename_label_in_project(&mut self, old_name: &str, new_name: &str) -> Result<()> {
+        if self.has_pending_action_guard() {
+            return Ok(());
+        }
+
+        let old_name = old_name.to_string();
+        let new_name = new_name.to_string();
+        let config = self.config.clone();
+        self.label_picker = None;
+        self.restore_return_mode();
+        self.begin_background_action(
+            format!("renaming label '{}' to '{}'", old_name, new_name),
+            async move {
+                let client = AsyncGitLabClient::new(&config)?;
+                client.rename_label(&old_name, &new_name).await?;
+                Ok(PendingActionResult::LabelRenamed {
+                    old_name: old_name.clone(),
+                    new_name: new_name.clone(),
+                    message: format!("label '{}' renamed to '{}'", old_name, new_name),
                 })
             },
         );
@@ -3157,6 +3265,33 @@ impl App {
                 self.status_line = message;
             }
             (
+                PendingActionState::Background { .. },
+                Ok(PendingActionResult::LabelRenamed {
+                    old_name,
+                    new_name,
+                    message,
+                }),
+            ) => {
+                for l in &mut self.labels {
+                    if *l == old_name {
+                        *l = new_name.clone();
+                    }
+                }
+                self.labels.sort();
+                self.labels.dedup();
+                for issue in &mut self.issues {
+                    for label in &mut issue.labels {
+                        if *label == old_name {
+                            *label = new_name.clone();
+                        }
+                    }
+                }
+                if self.filters.label.as_deref() == Some(&old_name) {
+                    self.filters.label = Some(new_name);
+                }
+                self.status_line = message;
+            }
+            (
                 PendingActionState::IssueSave {
                     draft, return_mode, ..
                 },
@@ -3475,6 +3610,48 @@ fn project_metas_from_store(store: &ConfigStore) -> Vec<ProjectMeta> {
             .then(left.project_url.cmp(&right.project_url))
     });
     projects
+}
+
+const CURRENT_VERSION: &str = env!("CARGO_PKG_VERSION");
+const REMOTE_CARGO_TOML: &str =
+    "https://raw.githubusercontent.com/ftorresd/glissues/main/Cargo.toml";
+
+fn parse_version(s: &str) -> Option<(u32, u32, u32)> {
+    let parts: Vec<&str> = s.trim().split('.').collect();
+    if parts.len() != 3 {
+        return None;
+    }
+    let major = parts[0].parse().ok()?;
+    let minor = parts[1].parse().ok()?;
+    let patch = parts[2].parse().ok()?;
+    Some((major, minor, patch))
+}
+
+fn spawn_update_check() -> Receiver<Option<String>> {
+    let (tx, rx) = mpsc::channel();
+    std::thread::spawn(move || {
+        let result = check_for_update();
+        let _ = tx.send(result);
+    });
+    rx
+}
+
+fn check_for_update() -> Option<String> {
+    let response = reqwest::blocking::get(REMOTE_CARGO_TOML).ok()?;
+    let body = response.text().ok()?;
+    let remote_version = body
+        .lines()
+        .find(|line| line.trim_start().starts_with("version"))?
+        .split('"')
+        .nth(1)?
+        .to_string();
+    let current = parse_version(CURRENT_VERSION)?;
+    let remote = parse_version(&remote_version)?;
+    if remote > current {
+        Some(remote_version)
+    } else {
+        None
+    }
 }
 
 #[cfg(test)]

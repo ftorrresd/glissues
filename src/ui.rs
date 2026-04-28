@@ -112,6 +112,10 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
     if app.has_alert() {
         draw_alert(frame, area, app);
     }
+
+    if app.update_available.is_some() {
+        draw_update_prompt(frame, area, app);
+    }
 }
 
 fn draw_header(frame: &mut Frame, area: Rect, app: &App) {
@@ -704,10 +708,42 @@ fn draw_label_editor(frame: &mut Frame, area: Rect, app: &App) {
     frame.render_stateful_widget(exclude_list, panes[1], &mut exclude_state);
 
     frame.render_widget(
-        Paragraph::new("Tab switch  Space toggle  u undo  C-d delete  Enter save  Esc cancel")
+        Paragraph::new("Tab switch  Space toggle  r rename  u undo  C-d delete  Enter save  Esc cancel")
             .style(Style::default().fg(c.muted).bg(c.panel)),
         sections[2],
     );
+
+    if let Some((original, buf)) = picker.rename_buffer.as_ref() {
+        let rename_popup = centered_rect(50, 20, area);
+        frame.render_widget(Clear, rename_popup);
+        frame.render_widget(
+            Block::default()
+                .borders(Borders::ALL)
+                .border_set(rounded_border_set())
+                .title(format!("Rename '{original}'"))
+                .style(Style::default().bg(c.panel).fg(c.accent)),
+            rename_popup,
+        );
+
+        let inner = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([Constraint::Min(1), Constraint::Length(1)])
+            .margin(1)
+            .split(rename_popup);
+
+        frame.render_widget(
+            Paragraph::new(buf.to_text())
+                .block(styled_block(c, "New name"))
+                .style(Style::default().bg(c.panel_alt).fg(c.text)),
+            inner[0],
+        );
+
+        frame.render_widget(
+            Paragraph::new("Enter confirm  Esc cancel")
+                .style(Style::default().fg(c.muted).bg(c.panel)),
+            inner[1],
+        );
+    }
 }
 
 fn draw_selector(frame: &mut Frame, area: Rect, app: &App) {
@@ -1251,6 +1287,50 @@ fn draw_alert(frame: &mut Frame, area: Rect, app: &App) {
     frame.render_widget(
         Paragraph::new(Text::from(lines))
             .block(pane_block(c, "Alert", true))
+            .style(Style::default().bg(c.panel).fg(c.text))
+            .wrap(Wrap { trim: false }),
+        popup,
+    );
+}
+
+fn draw_update_prompt(frame: &mut Frame, area: Rect, app: &App) {
+    let c = colors(app.theme.palette());
+    let Some(new_version) = app.update_available.as_ref() else {
+        return;
+    };
+
+    let current_version = env!("CARGO_PKG_VERSION");
+    let popup = centered_rect(56, 36, area);
+    let text = Text::from(vec![
+        Line::from(Span::styled(
+            "Update Available",
+            Style::default().fg(c.accent),
+        )),
+        Line::default(),
+        Line::from(vec![
+            Span::styled("New version: ", Style::default().fg(c.muted)),
+            Span::styled(new_version.clone(), Style::default().fg(c.text)),
+        ]),
+        Line::from(vec![
+            Span::styled("Running:     ", Style::default().fg(c.muted)),
+            Span::styled(current_version, Style::default().fg(c.text)),
+        ]),
+        Line::default(),
+        Line::from(Span::styled(
+            "Install the update now?",
+            Style::default().fg(c.text),
+        )),
+        Line::default(),
+        Line::from(Span::styled(
+            "Press y to update, n or Esc to skip.",
+            Style::default().fg(c.muted),
+        )),
+    ]);
+
+    frame.render_widget(Clear, popup);
+    frame.render_widget(
+        Paragraph::new(text)
+            .block(pane_block(c, "Update Available", true))
             .style(Style::default().bg(c.panel).fg(c.text))
             .wrap(Wrap { trim: false }),
         popup,

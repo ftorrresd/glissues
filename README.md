@@ -1,143 +1,152 @@
 # glissues
 
-`glissues` is a keyboard-first terminal issue list with live preview for managing GitLab issues as todo items.
+`glissues` is a terminal app for working with GitLab issues as a personal todo list.
 
-It is built around the GitLab REST API and supports:
+It gives you a keyboard-first issue list with a live preview pane, so you can quickly review, create, edit, comment on, close, reopen, label, and search issues without leaving your terminal.
 
-- creating issues as todos
-- editing title and markdown body
-- closing and reopening issues
-- label editing with autocomplete
-- comments
-- blockers
-- due date picking
-- filters for state, label, and free-text search
-- multiple stored projects with per-project theme memory
-- async background preload for stored projects
-- plain-text private token storage in the local config file
+## What you can do
 
-## Build
-
-This project targets the system libc toolchain.
-
-```bash
-cargo build --release
-```
-
-The binary is written to `target/release/glissues`.
-
-## Configuration
-
-`glissues` reads configuration from these sources:
-
-1. command-line flags
-2. environment variables
-3. `~/.config/glissues/config.toml`
-
-CLI / environment settings for opening a new project:
-
-- `project` as a full GitLab project URL
-- `private_token`
-
-Environment variables:
-
-- `GLISSUES_PROJECT`
-- `GLISSUES_PROJECT_URL`
-- `GLISSUES_PRIVATE_TOKEN`
-
-The config file stores:
-
-- the last opened project
-- the last selected theme
-- stored projects
-- GitLab private tokens in plain text
-
-For a brand-new project, pass a project URL and private token through CLI flags or environment variables.
-When the project is not already stored, `glissues` asks whether you want to save it.
-
-Stored projects can later be opened without passing a private token again because the token is saved directly in `~/.config/glissues/config.toml`.
-
-This is convenient, but it means your stored GitLab tokens are not encrypted at rest.
-
-A sample config file is included as `config.example.toml`.
-
-## Run
-
-```bash
-export GLISSUES_PROJECT="https://gitlab.cern.ch/ftorresd/todo"
-export GLISSUES_PRIVATE_TOKEN="your-private-token"
-cargo run --release
-```
-
-You can also pass the project URL directly:
-
-```bash
-cargo run --release -- --project "https://gitlab.cern.ch/ftorresd/todo" --private-token "your-private-token"
-```
+- Browse GitLab issues in a fast terminal UI
+- Create issues as todo items
+- Edit issue titles and markdown descriptions
+- Add comments
+- Close and reopen issues
+- Manage labels with autocomplete
+- Set due dates
+- Add and remove blockers
+- Filter by state, label, or search text
+- Switch between stored GitLab projects
+- Choose and remember themes per project
 
 ## Install
 
-To install the latest released version into your user-local bin directory:
+### Install the latest release
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/ftorrresd/glissues/main/scripts/install.sh | sh
 ```
 
-The installer downloads the newest GitHub release for your platform and installs `glissues` into `~/.local/bin` by default.
+The installer downloads the latest release for your platform and installs `glissues` into:
 
-If `~/.local/bin` is not already on your `PATH`, add it to your shell profile:
+```text
+~/.local/bin
+```
+
+If that directory is not on your `PATH`, add it to your shell profile:
 
 ```bash
 export PATH="$HOME/.local/bin:$PATH"
 ```
 
-## Keybindings
+Then start the app with:
 
-- `j` / `k`: move through the issue list
-- `gg` / `G`: jump to top or bottom of the list
-- `Enter`: open the selected issue in a popup
-- `Esc`: close the open issue popup or leave an overlay
-- `j` / `k` or arrows in the issue popup: scroll the issue content
-- `Ctrl-u` / `Ctrl-d`: scroll the open issue faster
-- `Ctrl-r`: refresh from GitLab
-- `p`: open the project picker
-- `P`: cycle to the next known project
-- `[` / `]`: cycle between known projects
-- `t`: open the theme selector and cycle themes with `h`/`l` or arrows
-- `n`: create a new issue
-- `e`: edit selected issue
-- `D`: delete the selected issue after confirmation
-- `x`: close or reopen selected issue
+```bash
+glissues --project "https://gitlab.example.com/group/project" --private-token "your-token"
+```
+
+### Build from source
+
+You can also build the binary locally with Cargo:
+
+```bash
+cargo build --release
+```
+
+The binary will be available at:
+
+```text
+target/release/glissues
+```
+
+## First run
+
+To open a project, pass the full GitLab project URL and a GitLab private token:
+
+```bash
+glissues \
+  --project "https://gitlab.example.com/group/project" \
+  --private-token "your-token"
+```
+
+You can also use environment variables:
+
+```bash
+export GLISSUES_PROJECT="https://gitlab.example.com/group/project"
+export GLISSUES_PRIVATE_TOKEN="your-token"
+glissues
+```
+
+On first use, `glissues` can save the project so you do not need to pass the token every time.
+
+## Command line options
+
+```text
+glissues [OPTIONS]
+```
+
+Options:
+
+- `--project <URL>`: full GitLab project URL, for example `https://gitlab.com/group/project`
+- `--private-token <TOKEN>`: GitLab private token used to access the project
+- `--config <PATH>`: path to a custom config file
+- `--help`: show command help
+- `--version`: show the installed version
+
+Supported environment variables:
+
+- `GLISSUES_PROJECT`
+- `GLISSUES_PROJECT_URL`
+- `GLISSUES_PRIVATE_TOKEN`
+
+Command line options take priority over environment variables and saved config.
+
+## Configuration
+
+By default, `glissues` stores its configuration at:
+
+```text
+~/.config/glissues/config.toml
+```
+
+The config file is used to remember:
+
+- the last opened project
+- stored projects
+- the last selected theme
+- per-project themes
+- GitLab private tokens for saved projects
+
+Stored GitLab private tokens are saved in plain text in the config file. Only save projects on machines where that is acceptable for you.
+
+A minimal stored-project config looks like this:
+
+```toml
+last_project = "https://gitlab.example.com/group/project"
+last_theme = "rose-pine"
+
+[[projects]]
+url = "https://gitlab.example.com/group/project"
+private_token = "your-token"
+theme = "rose-pine"
+```
+
+You can keep multiple projects in the same config file and switch between them inside the app.
+
+## Basic controls
+
+- `j` / `k`: move through issues
+- `Enter`: open the selected issue
+- `n`: create an issue
+- `e`: edit the selected issue
 - `c`: add a comment
-- `b`: add a blocker
-- `B`: remove a blocker
-- `a`: edit labels with autocomplete
-- `d`: open due date picker
-- `Tab`: cycle all/open/closed filter
-- `F`: filter by label
+- `x`: close or reopen the selected issue
+- `a`: edit labels
+- `d`: set due date
 - `/`: search
-- `:`: command mode
-- `?`: help
+- `F`: filter by label
+- `Tab`: cycle issue state filter
+- `p`: open project picker
+- `t`: open theme selector
+- `Ctrl-r`: refresh
+- `?`: show help
 - `Ctrl-c`: quit
-
-Inside the editor/comment popups:
-
-- typing always inserts text
-- `Esc`: close the current editor popup and keep the draft locally
-- `Tab`: switch fields
-- `#`: open issue mention picker and insert an issue reference like `#19`
-- `Ctrl-s`: save
-
-## Automation
-
-- Pull requests and pushes to `main` run formatting, tests, and a release-build check in GitHub Actions
-- Published GitHub releases build and upload release archives for supported Linux and macOS targets
-
-## Notes
-
-- GitLab issue `opened` / `closed` remains the source of truth for lifecycle state.
- - Startup preloads all known projects in the background, and each project preload includes issues, comments, and blocker links.
- - Active-project refreshes and edits run in the background so the TUI stays responsive during GitLab requests.
- - The UI uses `ratatui-themes` with Rosé Pine as the default theme, and your last chosen theme is remembered in `~/.config/glissues/config.toml`.
- - Stored project private tokens are saved in plain text in `~/.config/glissues/config.toml`.
- - New stored projects inherit the current theme, and each stored project remembers its own theme.

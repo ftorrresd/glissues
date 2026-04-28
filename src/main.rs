@@ -31,9 +31,16 @@ fn main() -> Result<()> {
 
     let mut terminal = setup_terminal()?;
     let result = run_app(&mut terminal, &mut app);
+    let should_restart = app.should_restart;
     restore_terminal(&mut terminal)?;
 
-    result
+    result?;
+
+    if should_restart {
+        run_update_and_restart()?;
+    }
+
+    Ok(())
 }
 
 fn get_git_editor() -> String {
@@ -90,6 +97,28 @@ fn open_in_external_editor(
     execute!(terminal.backend_mut(), EnterAlternateScreen)?;
     terminal.clear()?;
     editor_result
+}
+
+fn run_update_and_restart() -> Result<()> {
+    use std::os::unix::process::CommandExt;
+
+    println!("Installing update...");
+    let status = std::process::Command::new("sh")
+        .arg("-c")
+        .arg("curl -fsSL https://raw.githubusercontent.com/ftorresd/glissues/main/scripts/install.sh | sh")
+        .status()?;
+
+    if !status.success() {
+        anyhow::bail!("install script failed with status: {status}");
+    }
+
+    let current_exe = std::env::current_exe()?;
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    let error = std::process::Command::new(&current_exe)
+        .args(&args)
+        .exec();
+
+    Err(anyhow::anyhow!("failed to restart: {error}"))
 }
 
 fn setup_terminal() -> Result<Terminal<CrosstermBackend<Stdout>>> {

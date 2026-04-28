@@ -510,6 +510,18 @@ impl AsyncGitLabClient {
         Ok(())
     }
 
+    pub async fn rename_label(&self, old_name: &str, new_name: &str) -> Result<()> {
+        self.http
+            .put(self.url(&format!("/labels/{}", urlencoding::encode(old_name))))
+            .form(&[("new_name", new_name)])
+            .send()
+            .await
+            .context("failed to rename label")?
+            .error_for_status()
+            .context("GitLab rejected label rename")?;
+        Ok(())
+    }
+
     async fn get_paginated<T>(&self, path: &str, query: &[(&str, String)]) -> Result<Vec<T>>
     where
         T: DeserializeOwned,
