@@ -114,9 +114,7 @@ fn run_update_and_restart() -> Result<()> {
 
     let current_exe = std::env::current_exe()?;
     let args: Vec<String> = std::env::args().skip(1).collect();
-    let error = std::process::Command::new(&current_exe)
-        .args(&args)
-        .exec();
+    let error = std::process::Command::new(&current_exe).args(&args).exec();
 
     Err(anyhow::anyhow!("failed to restart: {error}"))
 }

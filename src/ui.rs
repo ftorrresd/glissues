@@ -708,8 +708,10 @@ fn draw_label_editor(frame: &mut Frame, area: Rect, app: &App) {
     frame.render_stateful_widget(exclude_list, panes[1], &mut exclude_state);
 
     frame.render_widget(
-        Paragraph::new("Tab switch  Space toggle  r rename  u undo  C-d delete  Enter save  Esc cancel")
-            .style(Style::default().fg(c.muted).bg(c.panel)),
+        Paragraph::new(
+            "Tab switch  Space toggle  r rename  u undo  C-d delete  Enter save  Esc cancel",
+        )
+        .style(Style::default().fg(c.muted).bg(c.panel)),
         sections[2],
     );
 
